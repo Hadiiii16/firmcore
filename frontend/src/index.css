@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    color-scheme: dark;
+    scrollbar-color: #2a2a35 #0e0e12;
+    scrollbar-width: thin;
+  }
+
+  body {
+    background-color: #050507;
+    color: #f1f5f9;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #0e0e12;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #2a2a35;
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3a3a45;
+  }
+}
+
+@layer utilities {
+  .text-terminal {
+    font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  }
+
+  .glow-green {
+    text-shadow: 0 0 8px rgba(74, 222, 128, 0.6);
+  }
+
+  .glow-cyan {
+    text-shadow: 0 0 8px rgba(34, 211, 238, 0.6);
+  }
+
+  .border-glow-green {
+    box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.3), 0 0 16px rgba(74, 222, 128, 0.1);
+  }
+
+  .border-glow-cyan {
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.3), 0 0 16px rgba(34, 211, 238, 0.1);
+  }
+}
+
+/* SSE log fade-in animation */
+@keyframes logFadeIn {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.log-line {
+  animation: logFadeIn 0.15s ease-out forwards;
+}

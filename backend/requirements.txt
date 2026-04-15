@@ -1,0 +1,21 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Async I/O
+aiosqlite==0.20.0
+aiofiles==24.1.0
+
+# Data validation
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# File upload
+python-multipart==0.0.12
+
+# HTTP client (Gemini API fallback / health checks)
+httpx>=0.28.1
+
+# Utilities
+python-ulid==3.0.0
+python-dotenv==1.0.1
