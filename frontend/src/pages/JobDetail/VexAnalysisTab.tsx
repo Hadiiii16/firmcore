@@ -1,9 +1,13 @@
+import { RefreshCw } from 'lucide-react'
 import { Bot } from 'lucide-react'
 import { SeverityBadge, VexBadge } from '../../components/Badge'
-import type { CveResult } from '../../types'
+import type { CveResult, JobStatus } from '../../types'
 
 interface VexAnalysisTabProps {
   cves: CveResult[]
+  onRetryVexSingle: (cveId: string) => Promise<void>
+  retryingCve: string | null
+  jobStatus: JobStatus | null
 }
 
 const VEX_ORDER = ['affected', 'under_investigation', 'not_affected', 'fixed']
@@ -13,18 +17,36 @@ function vexOrder(status: string | null) {
   return idx === -1 ? VEX_ORDER.length : idx
 }
 
-export function VexAnalysisTab({ cves }: VexAnalysisTabProps) {
+export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus }: VexAnalysisTabProps) {
+  const canRetry = jobStatus === 'completed' || jobStatus === 'failed' || jobStatus === 'vex_analyzing'
+
   const withVex = cves
-    .filter((c) => c.vex_status)
+    .filter((c) => c.vex_status && c.vex_status !== 'unknown')
     .sort((a, b) => vexOrder(a.vex_status) - vexOrder(b.vex_status))
 
-  const noVex = cves.filter((c) => !c.vex_status)
+  const noVex = cves.filter((c) => !c.vex_status || c.vex_status === 'unknown')
 
   if (cves.length === 0) {
     return (
       <div className="text-center py-16 text-gray-600 font-mono text-sm">
         No vulnerability data available.
       </div>
+    )
+  }
+
+  function RetryButton({ cveId }: { cveId: string }) {
+    const isThis = retryingCve === cveId
+    const isBusy = retryingCve !== null
+    return (
+      <button
+        onClick={() => void onRetryVexSingle(cveId)}
+        disabled={isBusy || !canRetry}
+        title={canRetry ? `${cveId} VEX 분석 재실행` : '분석 완료 후 사용 가능'}
+        className="flex items-center gap-1 px-2 py-1 rounded text-xs font-mono bg-surface-800 text-gray-500 border border-surface-600 hover:bg-cyan-900/40 hover:text-accent-cyan hover:border-cyan-700/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
+      >
+        <RefreshCw size={11} className={isThis ? 'animate-spin' : ''} />
+        {isThis ? 'Analyzing…' : 'Re-analyze'}
+      </button>
     )
   }
 
@@ -49,8 +71,9 @@ export function VexAnalysisTab({ cves }: VexAnalysisTabProps) {
             <SeverityBadge severity={cve.severity} />
             <span className="font-mono text-sm text-accent-cyan font-semibold">{cve.cve_id}</span>
             <span className="text-gray-500 text-sm font-mono">{cve.package_name} {cve.package_version}</span>
-            <div className="ml-auto">
+            <div className="ml-auto flex items-center gap-2">
               <VexBadge status={cve.vex_status} />
+              <RetryButton cveId={cve.cve_id} />
             </div>
           </div>
 
@@ -96,7 +119,8 @@ export function VexAnalysisTab({ cves }: VexAnalysisTabProps) {
               <li key={cve.cve_id} className="flex items-center gap-3 px-5 py-2.5">
                 <SeverityBadge severity={cve.severity} />
                 <span className="font-mono text-sm text-gray-400">{cve.cve_id}</span>
-                <span className="text-xs text-gray-600 font-mono">{cve.package_name}</span>
+                <span className="text-xs text-gray-600 font-mono flex-1">{cve.package_name}</span>
+                <RetryButton cveId={cve.cve_id} />
               </li>
             ))}
           </ul>

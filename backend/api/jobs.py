@@ -86,28 +86,28 @@ async def list_jobs(
 
 
 @router.get("/{job_id}/stream")
-async def stream_job(job_id: str, request: Request) -> StreamingResponse:
+async def stream_job(
+    job_id: str,
+    request: Request,
+    after_id: int = Query(0, ge=0, description="이 ID 이후 이벤트만 전송 (재연결 시 중복 방지)"),
+) -> StreamingResponse:
     """
     SSE(Server-Sent Events)로 Job 진행 상황을 실시간 스트리밍합니다.
 
-    이벤트 타입:
-      stage_start, stage_progress, stage_complete — 파이프라인 단계
-      gemini_response, executing_command, command_result, vex_complete — VEX 분석
-      job_complete — 분석 완료 (status: completed | failed)
-      error — 오류 발생
+    after_id=N 을 지정하면 DB event ID N 이후 이벤트만 전송합니다.
+    초기 로드는 after_id=0(기본값), retry 재연결은 마지막 수신 ID를 전달합니다.
     """
-    # Job 존재 확인
     async with get_db() as db:
         job = await db_get_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
 
     return StreamingResponse(
-        _sse_generator(job_id, request),
+        _sse_generator(job_id, request, start_after_id=after_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",         # Nginx 버퍼링 비활성화
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
@@ -116,29 +116,37 @@ async def stream_job(job_id: str, request: Request) -> StreamingResponse:
 async def _sse_generator(
     job_id: str,
     request: Request,
+    start_after_id: int = 0,
 ) -> AsyncGenerator[str, None]:
     """
     SSE 이벤트 스트림 제너레이터.
 
     전략:
     1. event_bus에 알림 큐 등록 (이벤트 발생 시 즉시 깨어남)
-    2. DB에서 기존 이벤트 전송 (재연결 시 히스토리 리플레이)
+    2. DB에서 start_after_id 이후 이벤트 전송 (재연결 시 중복 방지)
     3. 이미 완료된 Job이면 스트림 종료
     4. 알림 큐 대기 (최대 10초) → 깨어나면 DB 폴링으로 신규 이벤트 전송
     5. job_complete 수신 시 스트림 종료
+    각 이벤트에 _db_id 필드를 삽입하여 클라이언트가 마지막 수신 ID를 추적할 수 있게 함
     """
     notify_q = subscribe(job_id)
-    last_event_id: int = 0
+    last_event_id: int = start_after_id
 
     try:
-        # ── 기존 이벤트 전송 (히스토리) ─────────────────────────────────
+        # ── 기존 이벤트 전송 (히스토리 또는 누락분) ──────────────────────
         async with get_db() as db:
-            history = await db_get_events(db, job_id, after_id=0)
+            history = await db_get_events(db, job_id, after_id=start_after_id)
             job = await db_get_job(db, job_id)
 
         for ev in history:
             last_event_id = ev["id"]
-            yield f"data: {ev['data']}\n\n"
+            # _db_id 필드 삽입 — 클라이언트가 재연결 시 after_id로 사용
+            try:
+                payload = json.loads(ev["data"])
+                payload["_db_id"] = ev["id"]
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            except (json.JSONDecodeError, KeyError):
+                yield f"data: {ev['data']}\n\n"
 
         # ── 이미 완료된 Job이면 스트림 종료 ─────────────────────────────
         if job and job["status"] in ("completed", "failed"):
@@ -174,15 +182,15 @@ async def _sse_generator(
             is_done = False
             for ev in new_events:
                 last_event_id = ev["id"]
-                yield f"data: {ev['data']}\n\n"
-
-                # job_complete 이벤트 수신 시 스트림 종료
                 try:
-                    parsed = json.loads(ev["data"])
-                    if parsed.get("type") in ("job_complete", "error"):
+                    payload = json.loads(ev["data"])
+                    payload["_db_id"] = ev["id"]
+                    data_str = json.dumps(payload, ensure_ascii=False)
+                    if payload.get("type") in ("job_complete", "error"):
                         is_done = True
                 except (json.JSONDecodeError, KeyError):
-                    pass
+                    data_str = ev["data"]
+                yield f"data: {data_str}\n\n"
 
             if is_done:
                 break
@@ -286,18 +294,19 @@ async def get_job_result(job_id: str) -> JobResult:
 @router.post("/{job_id}/retry-vex", status_code=202)
 async def retry_vex(job_id: str, background_tasks: BackgroundTasks) -> dict:
     """
-    이미 스캔이 완료된 Job에서 VEX 분석만 재실행합니다.
-    scan.json이 존재해야 하며, Job 상태가 completed 또는 failed여야 합니다.
+    중단된 VEX 분석을 이어서 실행합니다.
+    이미 완료된 CVE (vex/{cve_id}_vex.json 존재)는 건너뛰고 나머지만 분석합니다.
+    완료 후 combined_vex.json을 재빌드합니다.
     """
     async with get_db() as db:
         job = await db_get_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
 
-    if job["status"] not in ("completed", "failed"):
+    if job["status"] not in ("completed", "failed", "vex_analyzing"):
         raise HTTPException(
             status_code=409,
-            detail=f"VEX 재분석은 completed 또는 failed 상태에서만 가능합니다 (현재: {job['status']})",
+            detail=f"VEX 재분석은 scanning 이후 상태에서만 가능합니다 (현재: {job['status']})",
         )
 
     storage_dir = Path(job["storage_dir"]) if job.get("storage_dir") else None
@@ -308,16 +317,54 @@ async def retry_vex(job_id: str, background_tasks: BackgroundTasks) -> dict:
         )
 
     import os
-    from pipeline.runner import run_vex_only
+    from pipeline.runner import run_vex_resume
     from pipeline.mock import run_mock_pipeline
 
     MOCK = os.environ.get("MOCK_PIPELINE", "false").lower() == "true"
     if MOCK:
         background_tasks.add_task(run_mock_pipeline, job_id)
     else:
-        background_tasks.add_task(run_vex_only, job_id)
+        background_tasks.add_task(run_vex_resume, job_id)
 
     return {"job_id": job_id, "status": "vex_analyzing"}
+
+
+@router.post("/{job_id}/retry-vex/{cve_id}", status_code=202)
+async def retry_vex_single(
+    job_id: str, cve_id: str, background_tasks: BackgroundTasks
+) -> dict:
+    """
+    특정 CVE에 대해서만 VEX 분석을 (재)실행합니다.
+    완료 후 combined_vex.json을 전체 재빌드합니다.
+    """
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
+
+    if job["status"] not in ("completed", "failed", "vex_analyzing"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"VEX 분석은 scanning 이후 상태에서만 가능합니다 (현재: {job['status']})",
+        )
+
+    if not job.get("rootfs_path"):
+        raise HTTPException(
+            status_code=422,
+            detail="rootfs_path가 없습니다. 추출 단계부터 다시 실행해야 합니다.",
+        )
+
+    import os
+    from pipeline.runner import run_vex_single
+    from pipeline.mock import run_mock_pipeline
+
+    MOCK = os.environ.get("MOCK_PIPELINE", "false").lower() == "true"
+    if MOCK:
+        background_tasks.add_task(run_mock_pipeline, job_id)
+    else:
+        background_tasks.add_task(run_vex_single, job_id, cve_id)
+
+    return {"job_id": job_id, "cve_id": cve_id, "status": "vex_analyzing"}
 
 
 # ---------------------------------------------------------------------------

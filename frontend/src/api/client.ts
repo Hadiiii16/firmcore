@@ -73,8 +73,18 @@ export function retryVex(jobId: string): Promise<{ job_id: string; status: strin
   return request(`/jobs/${jobId}/retry-vex`, { method: 'POST' })
 }
 
+export function retryVexSingle(
+  jobId: string,
+  cveId: string,
+): Promise<{ job_id: string; cve_id: string; status: string }> {
+  return request(`/jobs/${jobId}/retry-vex/${encodeURIComponent(cveId)}`, { method: 'POST' })
+}
+
 // ── SSE Stream ────────────────────────────────────────────────────────────────
 
-export function createJobStream(jobId: string): EventSource {
-  return new EventSource(`${BASE}/jobs/${jobId}/stream`)
+export function createJobStream(jobId: string, afterId = 0): EventSource {
+  const url = afterId > 0
+    ? `${BASE}/jobs/${jobId}/stream?after_id=${afterId}`
+    : `${BASE}/jobs/${jobId}/stream`
+  return new EventSource(url)
 }

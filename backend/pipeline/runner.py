@@ -35,9 +35,6 @@ from pipeline.vex import VexResult, analyze_cve_batch
 
 logger = logging.getLogger(__name__)
 
-# VEX 분석 대상 CVE 최대 수 (Critical/High 우선)
-MAX_VEX_CVES = int(os.environ.get("MAX_VEX_CVES", "20"))
-
 # scanner._parse_vulnerabilities 재사용
 from pipeline.scanner import _parse_vulnerabilities as _parse_scan_vulns
 
@@ -119,6 +116,142 @@ async def run_vex_only(job_id: str) -> None:
     )
 
     await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir)
+
+
+async def run_vex_resume(job_id: str) -> None:
+    """
+    중단된 VEX 분석을 이어서 실행합니다.
+    이미 완료된 CVE (vex/{cve_id}_vex.json 존재)는 건너뜁니다.
+    """
+    logger.info("[Runner] VEX 이어서 분석 시작: job=%s", job_id)
+
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+        if not job:
+            logger.error("[Runner] Job 없음: %s", job_id)
+            return
+
+    storage_dir = Path(job["storage_dir"])
+    rootfs_path_str = job.get("rootfs_path")
+    if not rootfs_path_str:
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message="rootfs_path가 저장되지 않아 VEX 재분석 불가",
+                                completed_at=now_iso())
+        return
+
+    rootfs_path = Path(rootfs_path_str)
+    product_info = {
+        "name": job["product_name"] or "firmware",
+        "version": job["product_version"] or "unknown",
+    }
+
+    scan_json = storage_dir / "scan.json"
+    if not scan_json.exists():
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message="scan.json이 없어 VEX 재분석 불가",
+                                completed_at=now_iso())
+        return
+
+    try:
+        import json as _json
+        data = _json.loads(scan_json.read_text(encoding="utf-8"))
+        vulnerabilities = _parse_scan_vulns(data)
+    except Exception as exc:
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message=f"scan.json 파싱 실패: {exc}",
+                                completed_at=now_iso())
+        return
+
+    # 이미 완료된 CVE 파악 (vex/{cve_id}_vex.json 존재 여부)
+    vex_dir = storage_dir / "vex"
+    all_cves = _select_cves_for_vex(vulnerabilities)
+    remaining = [c for c in all_cves if not (vex_dir / f"{c}_vex.json").exists()]
+
+    logger.info("[Runner] VEX 이어서: 전체 %d개 중 %d개 미완료", len(all_cves), len(remaining))
+
+    if not remaining:
+        logger.info("[Runner] 모든 CVE가 이미 완료됨 — combined_vex.json만 재빌드")
+        from pipeline.vex import rebuild_combined_vex_from_dir
+        rebuild_combined_vex_from_dir(product_info, vex_dir, storage_dir)
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="completed",
+                                error_message=None, completed_at=now_iso())
+        return
+
+    async with get_db() as db:
+        await db_update_job(db, job_id, status="vex_analyzing",
+                            error_message=None, completed_at=None)
+
+    from pipeline.scanner import ScanResult
+    # 미완료 CVE만 포함한 가상 ScanResult (진행률 계산용)
+    filtered_vulns = [v for v in vulnerabilities if v.cve_id in remaining]
+    scan_result = ScanResult(
+        vulnerabilities=filtered_vulns,
+        counts_by_severity={},
+        total_count=len(filtered_vulns),
+        log=[],
+        success=True,
+    )
+
+    await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir,
+                     cve_override=remaining)
+
+
+async def run_vex_single(job_id: str, cve_id: str) -> None:
+    """
+    단일 CVE에 대해서만 VEX 분석을 실행합니다.
+    완료 후 combined_vex.json을 전체 재빌드합니다.
+    """
+    logger.info("[Runner] 단일 CVE VEX 분석: job=%s cve=%s", job_id, cve_id)
+
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+        if not job:
+            logger.error("[Runner] Job 없음: %s", job_id)
+            return
+
+    storage_dir = Path(job["storage_dir"])
+    rootfs_path_str = job.get("rootfs_path")
+    if not rootfs_path_str:
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message="rootfs_path가 저장되지 않아 VEX 분석 불가",
+                                completed_at=now_iso())
+        return
+
+    rootfs_path = Path(rootfs_path_str)
+    product_info = {
+        "name": job["product_name"] or "firmware",
+        "version": job["product_version"] or "unknown",
+    }
+
+    async with get_db() as db:
+        await db_update_job(db, job_id, status="vex_analyzing",
+                            error_message=None, completed_at=None)
+
+    from pipeline.scanner import ScanResult, Vulnerability
+    # 단일 CVE용 더미 ScanResult
+    scan_result = ScanResult(
+        vulnerabilities=[Vulnerability(cve_id=cve_id, package_name="", package_version="",
+                                       severity="UNKNOWN", description="", fix_version=None, urls=[])],
+        counts_by_severity={},
+        total_count=1,
+        log=[],
+        success=True,
+    )
+
+    await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir,
+                     cve_override=[cve_id])
+
+    # 완료 후 combined_vex.json 전체 재빌드 (기존 완료 CVE 포함)
+    vex_dir = storage_dir / "vex"
+    if vex_dir.exists():
+        from pipeline.vex import rebuild_combined_vex_from_dir
+        rebuild_combined_vex_from_dir(product_info, vex_dir, storage_dir)
+        logger.info("[Runner] combined_vex.json 재빌드 완료 (단일 CVE 후)")
 
 
 async def run_pipeline(job_id: str) -> None:
@@ -302,14 +435,15 @@ async def _stage_vex(
     rootfs_path: Path,
     product_info: dict,
     storage_dir: Path,
+    cve_override: Optional[list[str]] = None,
 ) -> None:
     stage = "vex_analyzing"
     t0 = time.monotonic()
 
     await _start_stage(job_id, stage)
 
-    # VEX 대상 CVE 선정: Critical/High 우선, 최대 MAX_VEX_CVES 개
-    cves_to_analyze = _select_cves_for_vex(scan_result.vulnerabilities)
+    # CVE 목록: 외부에서 명시적으로 전달된 경우 우선 사용 (resume/single 모드)
+    cves_to_analyze = cve_override if cve_override is not None else _select_cves_for_vex(scan_result.vulnerabilities)
     total = len(cves_to_analyze)
 
     vex_result: Optional[VexResult] = None
@@ -416,8 +550,8 @@ async def _stage_vex(
 
 def _select_cves_for_vex(vulns: list[Vulnerability]) -> list[str]:
     """
-    VEX 분석 대상 CVE를 severity 우선순위 기준으로 선정합니다.
-    중복 CVE ID 제거, 최대 MAX_VEX_CVES 개 반환.
+    VEX 분석 대상 CVE를 severity 우선순위 기준으로 반환합니다.
+    중복 CVE ID 제거, Critical/High/Medium/Low 순 정렬.
     """
     seen: set[str] = set()
     unique: list[Vulnerability] = []
@@ -426,7 +560,7 @@ def _select_cves_for_vex(vulns: list[Vulnerability]) -> list[str]:
             seen.add(v.cve_id)
             unique.append(v)
 
-    return [v.cve_id for v in unique[:MAX_VEX_CVES]]
+    return [v.cve_id for v in unique]
 
 
 async def _emit_event(job_id: str, event: dict) -> None:

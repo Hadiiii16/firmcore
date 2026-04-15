@@ -31,7 +31,7 @@ export function JobDetail() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState<Tab>('log')
 
-  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, retryVex } =
+  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, retryingCve, retryVex, retryVexSingle } =
     useJobDetail(jobId!)
 
   const tabs: TabConfig[] = [
@@ -133,7 +133,7 @@ export function JobDetail() {
           {errorMessage && (
             <div className="flex items-start gap-3 bg-red-900/20 border border-red-800/40 rounded-lg px-4 py-2">
               <p className="text-sm text-red-400 font-mono flex-1">✗ {errorMessage}</p>
-              {(status === 'failed' || status === 'completed') && (
+              {(status === 'failed' || status === 'completed' || status === 'vex_analyzing') && (
                 <button
                   onClick={() => void retryVex()}
                   disabled={retrying}
@@ -146,7 +146,7 @@ export function JobDetail() {
             </div>
           )}
           {/* Retry VEX button when completed (no error) */}
-          {!errorMessage && (status === 'completed' || status === 'failed') && (
+          {!errorMessage && (status === 'completed' || status === 'failed' || status === 'vex_analyzing') && (
             <div className="flex justify-end">
               <button
                 onClick={() => void retryVex()}
@@ -234,7 +234,12 @@ export function JobDetail() {
               <VulnerabilitiesTab cves={result?.cve_results ?? []} />
             )}
             {activeTab === 'vex' && (
-              <VexAnalysisTab cves={result?.cve_results ?? []} />
+              <VexAnalysisTab
+                cves={result?.cve_results ?? []}
+                onRetryVexSingle={retryVexSingle}
+                retryingCve={retryingCve}
+                jobStatus={status}
+              />
             )}
           </div>
         </div>

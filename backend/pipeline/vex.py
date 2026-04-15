@@ -46,6 +46,19 @@ GEMINI_TIMEOUT = 300        # seconds per Gemini CLI call
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 MAX_CMD_OUTPUT_CHARS = 3000  # truncate per command result sent back to Gemini
 
+# CVE 간 딜레이 (Gemini rate limit 방지)
+CVE_INTER_DELAY = int(os.environ.get("VEX_CVE_DELAY", "5"))  # seconds between CVEs
+
+# 요청 제한 재시도: 지수 백오프 (30s, 60s, 120s)
+_RATE_LIMIT_BACKOFF = [30, 60, 120]
+
+# ANSI 이스케이프 코드 제거 (대화형 CLI 출력 정제용)
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text)
+
 # ---------------------------------------------------------------------------
 # Security: command blacklist
 # ---------------------------------------------------------------------------
@@ -320,43 +333,35 @@ async def execute_command_in_rootfs(
 
 
 # ---------------------------------------------------------------------------
-# Gemini caller (CLI 전용)
+# Gemini caller (CLI headless 모드, 매 턴 단일 호출)
 # ---------------------------------------------------------------------------
 
+# 히스토리 슬라이딩 윈도우: 최근 N턴만 전달 (시스템프롬프트 + 이전 대화 크기 제한)
+HISTORY_WINDOW = int(os.environ.get("VEX_HISTORY_WINDOW", "8"))  # 최근 8개 메시지 (4턴)
 
-def _serialize_history_for_cli(
-    messages: list[dict],
-    system_prompt: str,
-) -> str:
-    """
-    대화 히스토리를 gemini CLI용 단일 프롬프트로 직렬화합니다.
-    """
-    parts = [
-        "=== 시스템 컨텍스트 (엄격히 따를 것) ===",
-        system_prompt.strip(),
-        "",
-        "=== 지금까지의 대화 ===",
-    ]
-    for msg in messages:
-        role = "사용자" if msg["role"] == "user" else "분석가"
-        parts.append(f"[{role}]\n{msg['content']}\n")
-    parts.append(
-        "\n위 대화의 마지막 [사용자] 메시지에 응답하세요. "
-        "시스템 컨텍스트의 규칙을 반드시 따르세요."
-    )
-    return "\n".join(parts)
+
+def _serialize_history_for_cli(history: list[dict]) -> str:
+    """대화 히스토리를 gemini CLI stdin 형식으로 직렬화합니다. (슬라이딩 윈도우 적용)"""
+    # 슬라이딩 윈도우: 가장 최근 HISTORY_WINDOW 개 메시지만 사용
+    windowed = history[-HISTORY_WINDOW:] if len(history) > HISTORY_WINDOW else history
+    parts = []
+    for msg in windowed:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        parts.append(f"[{role}]: {msg['content']}")
+    return "\n\n".join(parts)
 
 
 async def call_gemini(
-    messages: list[dict],
-    system_prompt: str,
+    history: list[dict],
+    new_message: str,
+    cve_id: str,
+    turn: int,
 ) -> str:
     """
-    gemini CLI를 통해 Gemini를 호출합니다.
-    `gemini` 명령어가 PATH에 있어야 하며, Google 계정으로 로그인되어 있어야 합니다.
+    gemini CLI를 headless 모드(-p)로 호출하여 응답을 반환합니다.
 
-    설치: npm install -g @google/gemini-cli
-    로그인: gemini  (첫 실행 시 브라우저 인증)
+    히스토리를 stdin으로 전달하고 새 메시지를 -p 인자로 넘깁니다.
+    슬라이딩 윈도우를 적용해 최근 HISTORY_WINDOW 개 메시지만 전송합니다.
     """
     gemini_bin = shutil.which("gemini")
     if not gemini_bin:
@@ -366,39 +371,69 @@ async def call_gemini(
             "  로그인: gemini  (첫 실행 시 Google 계정 인증)"
         )
 
-    prompt = _serialize_history_for_cli(messages, system_prompt)
-    prompt_bytes = prompt.encode("utf-8")
+    # stdin: 기존 대화 히스토리 (슬라이딩 윈도우)
+    stdin_text = _serialize_history_for_cli(history) if history else ""
+    stdin_bytes = stdin_text.encode("utf-8") if stdin_text else None
+
+    deadline = time.monotonic() + GEMINI_TIMEOUT
+    heartbeat_logged_at = time.monotonic()
+
+    logger.info("[VEX] %s Turn %d — gemini 호출 (히스토리 %d개 메시지, 창 %d개)",
+                cve_id, turn, len(history), min(len(history), HISTORY_WINDOW))
+
+    proc = await asyncio.create_subprocess_exec(
+        gemini_bin,
+        "--model", GEMINI_MODEL,
+        "--yolo",
+        "-p", new_message,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    # heartbeat 로그를 찍으면서 응답 대기
+    async def _wait_with_heartbeat():
+        nonlocal heartbeat_logged_at
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                raise RuntimeError(f"gemini 응답 타임아웃 ({GEMINI_TIMEOUT}초)")
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(input=stdin_bytes),
+                    timeout=min(30.0, remaining),
+                )
+                return stdout_b, stderr_b
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                total_waited = now - (deadline - GEMINI_TIMEOUT)
+                logger.info("[VEX] %s Turn %d — Gemini 응답 대기 중... (%.0fs 경과)",
+                            cve_id, turn, total_waited)
+                heartbeat_logged_at = now
+                stdin_bytes_ref = None  # communicate는 한 번만 가능 → 재시도 불가
 
     try:
-        # 프롬프트는 stdin으로 전달 (CLI 인자 크기 제한 우회)
-        # -p " " : 헤드리스(비대화형) 모드 활성화, stdin 내용이 앞에 붙음
-        proc = await asyncio.create_subprocess_exec(
-            gemini_bin,
-            "--model", GEMINI_MODEL,
-            "-p", " ",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(input=prompt_bytes),
+            proc.communicate(input=stdin_bytes),
             timeout=GEMINI_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
-        raise RuntimeError(f"gemini CLI 타임아웃 ({GEMINI_TIMEOUT}초)")
-    except OSError as exc:
-        raise RuntimeError(f"gemini CLI 실행 실패: {exc}")
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"gemini 응답 타임아웃 ({GEMINI_TIMEOUT}초)")
 
-    if proc.returncode != 0:
-        err = stderr_b.decode(errors="replace")[:500]
-        raise RuntimeError(f"gemini CLI 오류 (exit {proc.returncode}): {err}")
+    response = stdout_b.decode("utf-8", errors="replace").strip()
 
-    return stdout_b.decode(errors="replace")
+    if proc.returncode != 0 and not response:
+        stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
+        err_msg = stderr_text or f"종료 코드 {proc.returncode}"
+        if "429" in err_msg or "quota exceeded" in err_msg.lower():
+            raise RuntimeError(f"[RATE_LIMIT] {err_msg}")
+        raise RuntimeError(f"gemini 오류: {err_msg}")
+
+    logger.info("[VEX] %s Turn %d — 응답 수신 (%d chars)", cve_id, turn, len(response))
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -570,74 +605,74 @@ async def run_vex_analysis_loop(
         "먼저 1단계-A 명령어부터 시작해줘."
     )
 
-    conversation_history: list[dict] = [
-        {"role": "user", "content": initial_message}
+    # ── 대화 히스토리 (시스템 프롬프트 포함, 슬라이딩 윈도우로 전달) ─────
+    # 첫 메시지: 시스템 프롬프트를 시스템 역할로 삽입
+    history: list[dict] = [
+        {"role": "user", "content": f"[시스템 지시사항]\n{system_prompt.strip()}"},
+        {"role": "assistant", "content": "네, 이해했습니다. 분석을 시작하겠습니다."},
+        {"role": "user", "content": initial_message},
     ]
 
     for turn in range(MAX_TURNS):
-        # # ── Gemini 호출 ─────────────────────────────────────────────────
-        # try:
-        #     # ⭐ 무료 티어 API 제한(429 에러)을 피하기 위해 5초 대기
-        #     await asyncio.sleep(5)
-        #     response = await call_gemini(conversation_history, system_prompt)
-        # except Exception as exc:
-        #     msg = f"Gemini 호출 실패 (Turn {turn + 1}): {exc}"
-        #     logger.error("[VEX] %s", msg)
-        #     yield {"type": "error", "message": msg}
-        #     return
+        # 현재 턴의 새 메시지 (히스토리의 마지막 user 메시지)
+        new_message = history[-1]["content"]
+        # 전달할 히스토리는 마지막 메시지 제외 (call_gemini 내부에서 슬라이딩 윈도우 적용)
+        history_ctx = history[:-1]
 
-        # yield {"type": "gemini_response", "turn": turn + 1, "content": response}
+        logger.info("[VEX] %s Turn %d — Gemini 호출", cve_id, turn + 1)
+        yield {"type": "stage_progress", "stage": "vex_analyzing",
+               "log": f"🤖 [{cve_id}] Turn {turn + 1} — Gemini 응답 대기 중..."}
 
-        # ── Gemini 호출 ───────────────────────────────────────────────────────
-        # 대화 히스토리 슬라이딩 윈도우: 최근 N턴만 유지 (프롬프트 크기 제한)
-        # 시스템 프롬프트 + 최근 8개 메시지(4턴)만 전달
-        HISTORY_WINDOW = 8
-        windowed_history = conversation_history[-HISTORY_WINDOW:] if len(conversation_history) > HISTORY_WINDOW else conversation_history
-
-        response = None
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                response = await call_gemini(windowed_history, system_prompt)
-                break
-            except Exception as exc:
-                err_msg = str(exc)
-                if "429" in err_msg or "Quota" in err_msg or "quota" in err_msg.lower():
-                    wait_time = 30
-                    logger.warning("[VEX] 요청 제한 (Turn %d, 시도 %d/%d). %d초 후 재시도...",
-                                   turn + 1, attempt + 1, max_retries, wait_time)
-                    await asyncio.sleep(wait_time)
-                else:
-                    msg = f"Gemini 호출 실패 (Turn {turn + 1}): {exc}"
-                    logger.error("[VEX] %s", msg)
-                    yield {"type": "error", "message": msg}
-                    return
-
-        if response is None:
-            msg = f"Gemini 재시도 한계 초과 (Turn {turn + 1})"
+        try:
+            response = await call_gemini(
+                history=history_ctx,
+                new_message=new_message,
+                cve_id=cve_id,
+                turn=turn + 1,
+            )
+        except Exception as exc:
+            msg = str(exc)
             logger.error("[VEX] %s", msg)
-            yield {"type": "error", "message": msg}
-            return
+            # rate limit 재시도
+            if "[RATE_LIMIT]" in msg:
+                backoff = _RATE_LIMIT_BACKOFF[min(turn, len(_RATE_LIMIT_BACKOFF) - 1)]
+                logger.warning("[VEX] rate limit — %d초 대기 후 재시도", backoff)
+                yield {"type": "stage_progress", "stage": "vex_analyzing",
+                       "log": f"⚠ rate limit — {backoff}초 대기 후 재시도"}
+                await asyncio.sleep(backoff)
+                try:
+                    response = await call_gemini(
+                        history=history_ctx,
+                        new_message=new_message,
+                        cve_id=cve_id,
+                        turn=turn + 1,
+                    )
+                except Exception as exc2:
+                    yield {"type": "error", "message": f"Gemini 호출 실패 (Turn {turn + 1}): {exc2}"}
+                    return
+            else:
+                yield {"type": "error", "message": f"Gemini 호출 실패 (Turn {turn + 1}): {msg}"}
+                return
 
         yield {"type": "gemini_response", "turn": turn + 1, "content": response}
         logger.info("[VEX] %s Turn %d: %d chars", cve_id, turn + 1, len(response))
 
-        # 턴별 응답을 파일로 저장
+        # 히스토리에 응답 추가
+        history.append({"role": "assistant", "content": response})
+
+        # 턴별 응답 파일 저장
         (output_dir / f"{cve_id}_turn_{turn + 1}.md").write_text(
             f"# {cve_id} — Turn {turn + 1}\n\n{response}\n",
             encoding="utf-8",
         )
 
-        # ── OpenVEX JSON 감지 → 완료 ─────────────────────────────────────
+        # ── OpenVEX JSON 감지 → 완료 ─────────────────────────────────
         if "openvex.dev" in response:
             vex_doc = extract_json_from_response(response)
             if vex_doc:
                 statement = _extract_statement_from_vex(cve_id, vex_doc, turn + 1)
-
-                # 분석 요약 보고서 추출: JSON 블록 앞의 텍스트
                 report_text = _extract_report_text(response)
-                statement.report_text = report_text  # statement에도 저장
+                statement.report_text = report_text
 
                 vex_path = output_dir / f"{cve_id}_vex.json"
                 vex_path.write_text(
@@ -655,9 +690,7 @@ async def run_vex_analysis_loop(
                 _save_analysis_summary(
                     cve_id=cve_id,
                     product_info=product_info,
-                    history=conversation_history + [
-                        {"role": "assistant", "content": response}
-                    ],
+                    history=history,
                     statement=statement,
                     output_dir=output_dir,
                 )
@@ -673,20 +706,16 @@ async def run_vex_analysis_loop(
                 }
                 return
 
-        # ── bash 명령어 추출 및 실행 ─────────────────────────────────────
+        # ── bash 명령어 추출 및 실행 ─────────────────────────────────
         commands = extract_commands_from_response(response)
 
         if not commands:
-            # 명령어도 VEX도 없으면 Gemini에 재요청
-            conversation_history.append({"role": "assistant", "content": response})
-            conversation_history.append({
-                "role": "user",
-                "content": (
-                    "응답에 ```bash 코드블록 명령어가 포함되지 않았습니다. "
-                    "다음 분석 단계의 명령어를 ```bash 블록으로 제공해주세요. "
-                    "또는 분석이 완료되었다면 OpenVEX JSON을 ```json 블록으로 출력해주세요."
-                ),
-            })
+            next_user_msg = (
+                "응답에 ```bash 코드블록 명령어가 포함되지 않았습니다. "
+                "다음 분석 단계의 명령어를 ```bash 블록으로 제공해주세요. "
+                "또는 분석이 완료되었다면 OpenVEX JSON을 ```json 블록으로 출력해주세요."
+            )
+            history.append({"role": "user", "content": next_user_msg})
             continue
 
         cmd_results: list[CommandResult] = []
@@ -694,13 +723,12 @@ async def run_vex_analysis_loop(
             yield {"type": "executing_command", "command": cmd}
             result = await execute_command_in_rootfs(cmd, str(rootfs_path))
 
-            # 전체 stdout 로깅 (잘리지 않게)
             full_out = (result.stdout or "").strip()
             if result.blocked:
                 logger.info("[VEX CMD] 차단: %s", cmd[:100])
             elif result.returncode not in (0, None) and not full_out:
-                stderr_preview = (result.stderr or "")[:200]
-                logger.info("[VEX CMD] 실패 (rc=%d): %s", result.returncode, stderr_preview)
+                logger.info("[VEX CMD] 실패 (rc=%d): %s",
+                            result.returncode, (result.stderr or "")[:200])
             else:
                 lines = full_out.splitlines()
                 logger.info("[VEX CMD] rc=%d, %d줄 출력:", result.returncode, len(lines))
@@ -712,16 +740,15 @@ async def run_vex_analysis_loop(
             yield {
                 "type": "command_result",
                 "command": cmd,
-                "result": result.stdout[:2000],  # SSE 전송용은 2000자 제한
+                "result": result.stdout[:2000],
                 "returncode": result.returncode,
                 "blocked": result.blocked,
             }
             cmd_results.append(result)
 
-        # ── 다음 턴 메시지 구성 ─────────────────────────────────────────
-        next_message = _format_results_for_gemini(commands, cmd_results)
-        conversation_history.append({"role": "assistant", "content": response})
-        conversation_history.append({"role": "user", "content": next_message})
+        # ── 다음 턴 메시지 (명령어 결과 전송) ────────────────────────
+        next_user_msg = _format_results_for_gemini(commands, cmd_results)
+        history.append({"role": "user", "content": next_user_msg})
 
     # ── 최대 턴 초과: under_investigation으로 마무리 ───────────────────────
     logger.warning("[VEX] %s 최대 턴(%d) 도달, under_investigation 처리", cve_id, MAX_TURNS)
@@ -761,28 +788,17 @@ async def analyze_cve_batch(
     product_info: dict,
     output_dir: Path,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    # """
-    # CVE 목록을 순차 처리하는 배치 분석기.
-
-    # Yields
-    # ------
-    # {"type": "batch_start", "total": int}
-    # {"type": "cve_start", "cve_id": str, "index": int, "total": int, "progress_pct": float}
-    # (run_vex_analysis_loop 의 모든 이벤트)
-    # {"type": "cve_done", "cve_id": str, "status": str, "index": int, "total": int}
-    # {"type": "batch_complete", "vex_result": VexResult}
-    # """
-    # total = len(cves)
-    # vex_dir = output_dir / "vex"
-    # vex_dir.mkdir(parents=True, exist_ok=True)
-
-    # yield {"type": "batch_start", "total": total}
     """
     CVE 목록을 순차 처리하는 배치 분석기.
+
+    Yields
+    ------
+    {"type": "batch_start", "total": int}
+    {"type": "cve_start", "cve_id": str, "index": int, "total": int, "progress_pct": float}
+    (run_vex_analysis_loop 의 모든 이벤트)
+    {"type": "cve_done", "cve_id": str, "status": str, "index": int, "total": int}
+    {"type": "batch_complete", "vex_result": VexResult}
     """
-    # ⭐ [테스트용 추가] 전체 목록 중 딱 1개만 남기고 자릅니다!
-    cves = cves[:1] 
-    
     total = len(cves)
     vex_dir = output_dir / "vex"
     vex_dir.mkdir(parents=True, exist_ok=True)
@@ -791,6 +807,9 @@ async def analyze_cve_batch(
     statements: list[VexStatement] = []
 
     for idx, cve_id in enumerate(cves, start=1):
+        # CVE 간 딜레이: 첫 번째 CVE 이후부터 적용 (rate limit 방지)
+        if idx > 1 and CVE_INTER_DELAY > 0:
+            await asyncio.sleep(CVE_INTER_DELAY)
         progress_pct = round((idx - 1) / total * 100, 1)
         yield {
             "type": "cve_start",
@@ -980,3 +999,50 @@ def _build_combined_vex(
         "version": 1,
         "statements": openvex_stmts,
     }
+
+
+def rebuild_combined_vex_from_dir(
+    product_info: dict,
+    vex_dir: Path,
+    output_dir: Path,
+) -> Path:
+    """
+    vex_dir 내의 모든 {cve_id}_vex.json 파일을 읽어
+    combined_vex.json을 재빌드합니다.
+
+    단일 CVE 재분석 또는 resume 완료 후 호출합니다.
+    """
+    statements: list[VexStatement] = []
+
+    for vex_file in sorted(vex_dir.glob("*_vex.json")):
+        try:
+            doc = json.loads(vex_file.read_text(encoding="utf-8"))
+            for stmt_dict in doc.get("statements", []):
+                cve_id = stmt_dict.get("vulnerability", {}).get("name", "")
+                if not cve_id:
+                    continue
+                stmt = VexStatement(
+                    cve_id=cve_id,
+                    status=stmt_dict.get("status", "under_investigation"),
+                    justification=stmt_dict.get("justification"),
+                    impact_statement=stmt_dict.get("impact_statement", ""),
+                    analysis_turns=stmt_dict.get("x_firmcore_turns", 0),
+                    report_text=stmt_dict.get("x_firmcore_report", ""),
+                )
+                statements.append(stmt)
+        except Exception as exc:
+            logger.warning("VEX 파일 파싱 실패, 건너뜀: %s (%s)", vex_file, exc)
+
+    if not statements:
+        logger.warning("rebuild_combined_vex_from_dir: 읽을 VEX 파일 없음")
+        combined_path = output_dir / "combined_vex.json"
+        return combined_path
+
+    combined_doc = _build_combined_vex(product_info, statements)
+    combined_path = output_dir / "combined_vex.json"
+    combined_path.write_text(
+        json.dumps(combined_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("combined_vex.json 재빌드 완료: %d개 statement", len(statements))
+    return combined_path

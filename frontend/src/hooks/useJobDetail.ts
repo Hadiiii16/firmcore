@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { createJobStream, getJobResult, retryVex } from '../api/client'
+import { createJobStream, getJobResult, retryVex, retryVexSingle } from '../api/client'
 import type { JobResult, JobStatus } from '../types'
 
 // 백엔드 SSE 실제 포맷
@@ -36,6 +36,7 @@ interface UseJobDetailState {
   errorMessage: string | null
   streaming: boolean
   retrying: boolean
+  retryingCve: string | null   // 개별 CVE 재분석 중인 CVE ID
 }
 
 export function useJobDetail(jobId: string) {
@@ -48,10 +49,13 @@ export function useJobDetail(jobId: string) {
     errorMessage: null,
     streaming: true,
     retrying: false,
+    retryingCve: null,
   })
 
   // reconnect trigger: increment to force SSE reconnect
   const [reconnectKey, setReconnectKey] = useState(0)
+  // retry 시 SSE가 기존 이벤트를 재전송하지 않도록 after_id 추적
+  const afterIdRef = useRef<number>(0)
 
   const esRef = useRef<EventSource | null>(null)
   const logIdRef = useRef(0)
@@ -74,7 +78,7 @@ export function useJobDetail(jobId: string) {
     setState((s) => ({ ...s, retrying: true }))
     try {
       await retryVex(jobId)
-      // SSE 재연결 — 기존 이벤트 히스토리는 유지하고 새 이벤트 추가
+      // 재연결 시 로그 초기화 — afterIdRef는 유지하여 기존 이벤트 재전송 방지
       setState((s) => ({
         ...s,
         retrying: false,
@@ -83,6 +87,7 @@ export function useJobDetail(jobId: string) {
         errorMessage: null,
         currentStage: 'vex_analyzing',
         stageProgress: 0,
+        logs: [],
       }))
       setReconnectKey((k) => k + 1)
     } catch (err) {
@@ -94,8 +99,32 @@ export function useJobDetail(jobId: string) {
     }
   }, [jobId])
 
+  const handleRetryVexSingle = useCallback(async (cveId: string) => {
+    setState((s) => ({ ...s, retryingCve: cveId }))
+    try {
+      await retryVexSingle(jobId, cveId)
+      setState((s) => ({
+        ...s,
+        retryingCve: null,
+        streaming: true,
+        status: 'vex_analyzing' as JobStatus,
+        errorMessage: null,
+        currentStage: 'vex_analyzing',
+        stageProgress: 0,
+        logs: [],
+      }))
+      setReconnectKey((k) => k + 1)
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        retryingCve: null,
+        errorMessage: (err as Error).message,
+      }))
+    }
+  }, [jobId])
+
   useEffect(() => {
-    const es = createJobStream(jobId)
+    const es = createJobStream(jobId, afterIdRef.current)
     esRef.current = es
 
     es.onmessage = (e: MessageEvent) => {
@@ -104,6 +133,10 @@ export function useJobDetail(jobId: string) {
         ev = JSON.parse(e.data as string) as RawEvent
       } catch {
         return
+      }
+      // DB 이벤트 ID 추적 (재연결 시 중복 방지)
+      if (typeof ev._db_id === 'number') {
+        afterIdRef.current = ev._db_id
       }
 
       const { type, stage = 'info', log, error, progress, elapsed } = ev
@@ -227,5 +260,5 @@ export function useJobDetail(jobId: string) {
   // reconnectKey 변경 시 SSE 재연결
   }, [jobId, addLog, loadResult, reconnectKey])
 
-  return { ...state, retryVex: handleRetryVex }
+  return { ...state, retryVex: handleRetryVex, retryVexSingle: handleRetryVexSingle }
 }
