@@ -73,6 +73,12 @@ export function retryVex(jobId: string): Promise<{ job_id: string; status: strin
   return request(`/jobs/${jobId}/retry-vex`, { method: 'POST' })
 }
 
+export function cancelVex(
+  jobId: string,
+): Promise<{ job_id: string; status: string; terminated_processes: number }> {
+  return request(`/jobs/${jobId}/cancel-vex`, { method: 'POST' })
+}
+
 export function retryVexSingle(
   jobId: string,
   cveId: string,

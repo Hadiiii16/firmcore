@@ -441,12 +441,15 @@ async def _stage_vex(
     t0 = time.monotonic()
 
     await _start_stage(job_id, stage)
+    cancel_marker = storage_dir / ".cancel_vex"
+    cancel_marker.unlink(missing_ok=True)
 
     # CVE 목록: 외부에서 명시적으로 전달된 경우 우선 사용 (resume/single 모드)
     cves_to_analyze = cve_override if cve_override is not None else _select_cves_for_vex(scan_result.vulnerabilities)
     total = len(cves_to_analyze)
 
     vex_result: Optional[VexResult] = None
+    vex_cancelled = False
 
     try:
         async for event in analyze_cve_batch(
@@ -464,22 +467,6 @@ async def _stage_vex(
             elif event_type == "gemini_response":
                 logger.info("[VEX] Turn %d 응답 수신 (%d chars)",
                             event.get("turn", 0), len(event.get("content", "")))
-            elif event_type == "executing_command":
-                # 주석(#)과 빈 줄 제거 후 실제 명령어 줄만 로깅
-                raw_cmd = event.get("command", "")
-                cmd_lines = [
-                    l.strip() for l in raw_cmd.splitlines()
-                    if l.strip() and not l.strip().startswith("#")
-                ]
-                if len(cmd_lines) == 1:
-                    logger.info("[VEX] 명령 실행: %s", cmd_lines[0])
-                else:
-                    logger.info("[VEX] 명령 실행 (%d줄 스크립트):", len(cmd_lines))
-                    for cl in cmd_lines:
-                        logger.info("[VEX]   %s", cl)
-            elif event_type == "command_result":
-                # 상세 로깅은 vex.py에서 원본 stdout 기준으로 처리
-                pass
             elif event_type == "vex_complete":
                 stmt = event.get("statement")
                 status = stmt.status if stmt else event.get("status", "?")
@@ -490,6 +477,9 @@ async def _stage_vex(
                 logger.info("[VEX] %s 완료: %s", event.get("cve_id", ""), event.get("status", ""))
             elif event_type == "error":
                 logger.error("[VEX] 오류: %s", event.get("message", ""))
+            elif event_type == "batch_cancelled":
+                logger.warning("[VEX] 분석 취소: %s", event.get("message", ""))
+                vex_cancelled = True
 
             # ── emit (직렬화 불가 객체 제거) ─────────────────────────────
             if event_type == "batch_complete":
@@ -508,8 +498,15 @@ async def _stage_vex(
                 async with get_db() as db:
                     await db_update_job(db, job_id, stage_progress=progress)
 
+            if vex_cancelled:
+                break
+
     except Exception as exc:
         await _fail_job(job_id, stage, f"VEX 분석 단계 예외: {exc}")
+        return
+
+    if vex_cancelled:
+        await _fail_job(job_id, stage, "VEX 분석이 사용자 요청으로 취소되었습니다.")
         return
 
     combined_vex_path = storage_dir / "combined_vex.json"

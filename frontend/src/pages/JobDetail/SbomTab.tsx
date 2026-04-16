@@ -58,7 +58,7 @@ export function SbomTab({ components }: SbomTabProps) {
               </tr>
             ) : (
               filtered.map((c) => (
-                <tr key={c.bom_ref} className="hover:bg-surface-800/40 transition-colors">
+                <tr key={c.purl ?? `${c.name}@${c.version}`} className="hover:bg-surface-800/40 transition-colors">
                   <td className="px-4 py-2.5 font-mono text-gray-200 font-medium">{c.name}</td>
                   <td className="px-4 py-2.5 font-mono text-accent-cyan text-xs">{c.version || '—'}</td>
                   <td className="px-4 py-2.5">

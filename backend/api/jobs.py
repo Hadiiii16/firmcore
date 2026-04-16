@@ -25,8 +25,17 @@ from typing import AsyncGenerator, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from db import db_get_events, db_get_job, db_get_stage_timings, db_list_jobs, get_db
-from event_bus import subscribe, unsubscribe
+from db import (
+    db_add_event,
+    db_get_events,
+    db_get_job,
+    db_get_stage_timings,
+    db_list_jobs,
+    db_update_job,
+    get_db,
+    now_iso,
+)
+from event_bus import broadcast, subscribe, unsubscribe
 from models.job import (
     CveResult,
     JobListResponse,
@@ -327,6 +336,55 @@ async def retry_vex(job_id: str, background_tasks: BackgroundTasks) -> dict:
         background_tasks.add_task(run_vex_resume, job_id)
 
     return {"job_id": job_id, "status": "vex_analyzing"}
+
+
+@router.post("/{job_id}/cancel-vex", status_code=202)
+async def cancel_vex(job_id: str) -> dict:
+    """
+    진행 중인 VEX 분석을 취소합니다.
+    현재 실행 중인 Gemini CLI 프로세스 그룹을 종료하고 배치 루프가 다음 CVE로
+    넘어가지 않도록 취소 마커를 남깁니다.
+    """
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
+
+    storage_dir = Path(job["storage_dir"]) if job.get("storage_dir") else None
+    if not storage_dir:
+        raise HTTPException(status_code=422, detail="storage_dir이 없습니다.")
+
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    (storage_dir / ".cancel_vex").write_text(now_iso(), encoding="utf-8")
+
+    from pipeline.vex import terminate_active_gemini_processes
+
+    terminated = await terminate_active_gemini_processes("cancel-vex API")
+
+    event = {
+        "type": "batch_cancelled",
+        "stage": "vex_analyzing",
+        "message": "VEX 분석 취소 요청을 처리했습니다.",
+        "terminated_processes": terminated,
+        "job_id": job_id,
+    }
+    async with get_db() as db:
+        await db_update_job(
+            db,
+            job_id,
+            status="failed",
+            current_stage="vex_analyzing",
+            error_message="VEX 분석이 사용자 요청으로 취소되었습니다.",
+            completed_at=now_iso(),
+        )
+        await db_add_event(db, job_id, event)
+    broadcast(job_id, event)
+
+    return {
+        "job_id": job_id,
+        "status": "cancelled",
+        "terminated_processes": terminated,
+    }
 
 
 @router.post("/{job_id}/retry-vex/{cve_id}", status_code=202)

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { createJobStream, getJobResult, retryVex, retryVexSingle } from '../api/client'
+import { cancelVex, createJobStream, getJobResult, retryVex, retryVexSingle } from '../api/client'
 import type { JobResult, JobStatus } from '../types'
 
 // 백엔드 SSE 실제 포맷
@@ -36,6 +36,7 @@ interface UseJobDetailState {
   errorMessage: string | null
   streaming: boolean
   retrying: boolean
+  cancelling: boolean
   retryingCve: string | null   // 개별 CVE 재분석 중인 CVE ID
 }
 
@@ -49,6 +50,7 @@ export function useJobDetail(jobId: string) {
     errorMessage: null,
     streaming: true,
     retrying: false,
+    cancelling: false,
     retryingCve: null,
   })
 
@@ -67,8 +69,15 @@ export function useJobDetail(jobId: string) {
 
   const loadResult = useCallback(async () => {
     try {
-      const result = await getJobResult(jobId)
-      setState((s) => ({ ...s, result, streaming: false }))
+      const data = await getJobResult(jobId)
+      setState((s) => ({
+        ...s,
+        result: data,
+        // 완료/실패 상태면 스트리밍 종료, 분석 중이면 유지
+        ...(data.status === 'completed' || data.status === 'failed'
+          ? { streaming: false }
+          : {}),
+      }))
     } catch {
       // 결과가 아직 준비되지 않은 경우 무시
     }
@@ -123,6 +132,33 @@ export function useJobDetail(jobId: string) {
     }
   }, [jobId])
 
+  const handleCancelVex = useCallback(async () => {
+    setState((s) => ({ ...s, cancelling: true }))
+    try {
+      await cancelVex(jobId)
+      setState((s) => ({
+        ...s,
+        cancelling: false,
+        streaming: false,
+        status: 'failed',
+        errorMessage: 'VEX 분석이 사용자 요청으로 취소되었습니다.',
+      }))
+      addLog('vex_analyzing', '■ VEX 분석 취소 요청 완료')
+      setReconnectKey((k) => k + 1)
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        cancelling: false,
+        errorMessage: (err as Error).message,
+      }))
+    }
+  }, [addLog, jobId])
+
+  // 페이지 로드 시 기존 결과 즉시 로드 (이미 완료된 job이면 VEX 탭 바로 표시)
+  useEffect(() => {
+    void loadResult()
+  }, [loadResult])
+
   useEffect(() => {
     const es = createJobStream(jobId, afterIdRef.current)
     esRef.current = es
@@ -176,16 +212,19 @@ export function useJobDetail(jobId: string) {
           break
 
         case 'job_complete':
+          {
+          const nextStatus = ev.status === 'failed' ? 'failed' : 'completed'
           setState((s) => ({
             ...s,
-            status: 'completed',
+            status: nextStatus,
             stageProgress: 100,
             streaming: false,
           }))
-          addLog('system', '✓ 분석 완료')
+          addLog('system', nextStatus === 'failed' ? '✗ 분석 종료' : '✓ 분석 완료')
           es.close()
           loadResult()
           break
+          }
 
         case 'job_failed':
           setState((s) => ({
@@ -236,6 +275,23 @@ export function useJobDetail(jobId: string) {
 
         case 'cve_done':
           addLog('vex_analyzing', `✓ ${ev.cve_id} 완료: ${ev.status}`)
+          // CVE 하나 완료될 때마다 VEX 탭 갱신 (incremental 표시)
+          void loadResult()
+          break
+
+        case 'batch_complete':
+          addLog('vex_analyzing', `✓ VEX 배치 분석 완료 (${(ev.total as number) ?? 0}개 CVE)`)
+          void loadResult()
+          break
+
+        case 'batch_cancelled':
+          setState((s) => ({
+            ...s,
+            status: 'failed',
+            streaming: false,
+            errorMessage: (ev.message as string) ?? 'VEX 분석이 취소되었습니다.',
+          }))
+          addLog('vex_analyzing', `■ ${(ev.message as string) ?? 'VEX 분석이 취소되었습니다.'}`)
           break
 
         case 'keepalive':
@@ -260,5 +316,10 @@ export function useJobDetail(jobId: string) {
   // reconnectKey 변경 시 SSE 재연결
   }, [jobId, addLog, loadResult, reconnectKey])
 
-  return { ...state, retryVex: handleRetryVex, retryVexSingle: handleRetryVexSingle }
+  return {
+    ...state,
+    retryVex: handleRetryVex,
+    retryVexSingle: handleRetryVexSingle,
+    cancelVex: handleCancelVex,
+  }
 }

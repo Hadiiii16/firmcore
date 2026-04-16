@@ -45,6 +45,11 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("DB 초기화 완료")
     yield
+    # 종료 시 실행 중인 모든 Gemini 서브프로세스를 정리
+    from pipeline.vex import terminate_active_gemini_processes
+    terminated = await terminate_active_gemini_processes("server shutdown")
+    if terminated:
+        logger.info("[Shutdown] Gemini 프로세스 %d개 종료 완료", terminated)
     logger.info("FirmCore 백엔드 종료")
 
 

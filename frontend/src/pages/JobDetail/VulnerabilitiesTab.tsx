@@ -38,9 +38,9 @@ function CveRow({ cve }: { cve: CveResult }) {
               {cve.description && (
                 <p>{cve.description}</p>
               )}
-              {cve.fixed_version && (
+              {cve.fix_version && (
                 <p className="font-mono text-xs">
-                  Fixed in: <span className="text-accent-green">{cve.fixed_version}</span>
+                  Fixed in: <span className="text-accent-green">{cve.fix_version}</span>
                 </p>
               )}
               {cve.vex_justification && (

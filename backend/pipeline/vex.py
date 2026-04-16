@@ -1,32 +1,35 @@
 """
-vex.py — Gemini CLI + 정적 분석 기반 자동화 VEX 분석기
+vex.py — Gemini CLI autonomous VEX analyzer
 
-"Gemini가 분석 명령어 추천 → 백엔드가 rootfs에서 실행 → 결과를 Gemini에 피드백"
-하는 멀티턴 루프로 OpenVEX 문서를 자동 생성합니다.
+Gemini CLI is invoked with --yolo and cwd=rootfs_path so it can run
+find/readelf/nm/strings/grep commands directly through its built-in Shell tool.
+The backend streams CLI stdout/stderr as stage_progress events and extracts the
+final OpenVEX JSON from the complete response.
 
-시스템 프롬프트 로드 우선순위:
-  1. VEX_SYSTEM_PROMPT 환경변수 경로
-  2. 프로젝트 루트 / vex_system_prompt_v2.md
-  3. 프로젝트 루트 / vex_system_prompt.md
-  4. 내장 기본 프롬프트 (fallback)
+System prompt load priority:
+  1. VEX_SYSTEM_PROMPT env var path
+  2. pipeline dir / vex_system_prompt_v3.md
+  3. pipeline dir / vex_system_prompt_v2.md
+  4. pipeline dir / vex_system_prompt.md
+  5. Built-in default prompt (fallback)
 
 Usage:
     async for event in run_vex_analysis_loop(cve_id, rootfs_path, product_info, output_dir):
         match event["type"]:
-            case "gemini_response":   print(event["content"][:120])
-            case "executing_command": print(f"$ {event['command']}")
-            case "command_result":    print(event["result"][:200])
-            case "vex_complete":      save(event["vex_document"])
+            case "stage_progress": print(event["log"])
+            case "vex_complete":   save(event["vex_document"])
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,11 +43,48 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_TURNS = int(os.environ.get("VEX_MAX_TURNS", "15"))
-COMMAND_TIMEOUT = int(os.environ.get("VEX_COMMAND_TIMEOUT", "300"))  # seconds per shell command
-GEMINI_TIMEOUT = 300        # seconds per Gemini CLI call
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
-MAX_CMD_OUTPUT_CHARS = 3000  # truncate per command result sent back to Gemini
+
+def _get_env(name: str, default: str) -> str:
+    """Read config from process env, then repo .env for local uvicorn runs."""
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.is_file():
+        return default
+
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, raw_value = raw.split("=", 1)
+            if key.strip() == name:
+                return raw_value.strip().strip('"').strip("'")
+    except OSError:
+        return default
+
+    return default
+
+
+GEMINI_TIMEOUT = int(_get_env("VEX_GEMINI_TIMEOUT", "1800"))  # seconds per Gemini CLI call (30min default)
+GEMINI_MODELS = [
+    model.strip()
+    for model in _get_env(
+        "GEMINI_MODELS",
+        _get_env("GEMINI_MODEL", "gemini-2.5-flash"),
+    ).split(",")
+    if model.strip()
+]
+if not GEMINI_MODELS:
+    GEMINI_MODELS = ["gemini-2.5-flash"]
+GEMINI_MODEL = GEMINI_MODELS[0]
+GEMINI_MODEL_RETRY_CYCLES = int(_get_env("VEX_GEMINI_MODEL_RETRY_CYCLES", "2"))
+GEMINI_HEARTBEAT_INTERVAL = int(_get_env("VEX_GEMINI_HEARTBEAT_INTERVAL", "30"))
+GEMINI_STREAM_LOG_CHARS = int(_get_env("VEX_GEMINI_STREAM_LOG_CHARS", "800"))
+GEMINI_CLI_MODE = _get_env("VEX_GEMINI_CLI_MODE", "interactive").strip().lower()
+GEMINI_OUTPUT_FORMAT = _get_env("VEX_GEMINI_OUTPUT_FORMAT", "stream-json").strip().lower()
 
 # CVE 간 딜레이 (Gemini rate limit 방지)
 CVE_INTER_DELAY = int(os.environ.get("VEX_CVE_DELAY", "5"))  # seconds between CVEs
@@ -52,57 +92,125 @@ CVE_INTER_DELAY = int(os.environ.get("VEX_CVE_DELAY", "5"))  # seconds between C
 # 요청 제한 재시도: 지수 백오프 (30s, 60s, 120s)
 _RATE_LIMIT_BACKOFF = [30, 60, 120]
 
-# ANSI 이스케이프 코드 제거 (대화형 CLI 출력 정제용)
+# ANSI 이스케이프 코드 제거
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
-# ---------------------------------------------------------------------------
-# Security: command blacklist
-# ---------------------------------------------------------------------------
-# rootfs 바깥 탈출, 네트워크 접근, 파일시스템 파괴 등 위험 패턴
-_BLACKLIST_RULES: list[tuple[str, str]] = [
-    (r"\brm\s+-[^\s]*[rf]",    "파일 삭제 명령 (rm -rf)"),
-    (r"\bdd\b",                 "디스크 덤프/쓰기 (dd)"),
-    (r"\bmkfs\b",               "파일시스템 포맷 (mkfs)"),
-    (r"\bwget\b",               "네트워크 다운로드 (wget)"),
-    (r"\bcurl\b",               "네트워크 요청 (curl)"),
-    (r"\bchmod\b",              "권한 변경 (chmod)"),
-    (r"\bchown\b",              "소유자 변경 (chown)"),
-    (r"\bmount\b",              "마운트 명령 (mount)"),
-    (r"\bumount\b",             "마운트 해제 (umount)"),
-    (r"\biptables\b",           "방화벽 설정 (iptables)"),
-    (r"\bsudo\b",               "권한 상승 (sudo)"),
-    (r"\bsu\s",                 "사용자 전환 (su)"),
-    (r"\bnc\b.*-[el]",          "Netcat 리스너"),
-    (r"\beval\b",               "동적 코드 실행 (eval)"),
-    (r"(?<!\d)(?<!2)>\s*/dev/(?!null)",  "/dev 장치 쓰기"),
-    (r"\|\s*(?:sh|bash|zsh)\b", "파이프를 셸로 전달"),
-    (r"[;&]\s*rm\b",            "체인 후 rm 실행"),
-    (r"\.\.[\\/]\.\.[\\/]",    "경로 탈출 (../../)"),
-    (r"\bpython[23]?\s+-[cm]\b","Python 모듈/코드 실행"),
-]
-_BLACKLIST_PATTERNS = [
-    (re.compile(pat, re.IGNORECASE), reason)
-    for pat, reason in _BLACKLIST_RULES
-]
+
+def _is_gemini_rate_limit(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "status 429" in lowered
+        or "code 429" in lowered
+        or "resource_exhausted" in lowered
+        or "model_capacity_exhausted" in lowered
+        or "no capacity available" in lowered
+        or "quota exceeded" in lowered
+        or "ratelimitexceeded" in lowered
+    )
+
+
+_ACTIVE_GEMINI_PROCS: set[asyncio.subprocess.Process] = set()
+
+
+def _setup_gemini_subprocess() -> None:
+    """Start Gemini in a new session and ask Linux to signal it if we die."""
+    os.setsid()
+    try:
+        libc = ctypes.CDLL(None)
+        pr_set_pdeathsig = 1
+        libc.prctl(pr_set_pdeathsig, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _gemini_process_args(gemini_bin: str, prompt: str, model: str) -> list[str]:
+    """Wrap Gemini so parent death or TERM kills the whole spawned process group."""
+    gemini_args = [gemini_bin]
+    if model and model.lower() not in {"auto", "default"}:
+        gemini_args.extend(["--model", model])
+    gemini_args.append("--yolo")
+    if GEMINI_OUTPUT_FORMAT in {"json", "stream-json"}:
+        gemini_args.extend(["--output-format", GEMINI_OUTPUT_FORMAT])
+    if GEMINI_CLI_MODE == "headless":
+        gemini_args.extend(["-p", prompt])
+    else:
+        # Matches the manual flow: gemini --yolo "@GEMINI.md ..."
+        # Gemini stays interactive after the final answer; the caller stops it
+        # once an OpenVEX document is detected in stdout.
+        gemini_args.append(prompt)
+
+    return [
+        "bash",
+        "-c",
+        (
+            "trap 'kill -TERM -- -$$ 2>/dev/null || true; wait' TERM INT HUP; "
+            '"$@" & child=$!; wait "$child"; exit $?'
+        ),
+        "gemini-runner",
+        *gemini_args,
+    ]
+
+
+async def _terminate_process_group(
+    proc: asyncio.subprocess.Process,
+    cve_id: str,
+    reason: str,
+) -> None:
+    """Terminate Gemini and any tools it spawned in the same process group."""
+    if proc.returncode is not None:
+        return
+
+    log = logger.info if reason.startswith("OpenVEX complete") else logger.warning
+    log("[VEX] %s terminating Gemini process group: %s", cve_id, reason)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        logger.warning("[VEX] %s failed to SIGTERM process group: %s", cve_id, exc)
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+        return
+    except asyncio.TimeoutError:
+        logger.warning("[VEX] %s Gemini process group ignored SIGTERM; sending SIGKILL", cve_id)
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        logger.warning("[VEX] %s failed to SIGKILL process group: %s", cve_id, exc)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+
+    try:
+        await proc.wait()
+    except ProcessLookupError:
+        pass
+
+
+async def terminate_active_gemini_processes(reason: str = "cancel requested") -> int:
+    """Terminate every Gemini process currently owned by this backend process."""
+    procs = list(_ACTIVE_GEMINI_PROCS)
+    for proc in procs:
+        await _terminate_process_group(proc, "active", reason)
+    return len(procs)
+
 
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class CommandResult:
-    command: str
-    stdout: str
-    stderr: str
-    returncode: int
-    elapsed: float          # seconds
-    blocked: bool = False
-    block_reason: Optional[str] = None
 
 
 @dataclass
@@ -140,6 +248,7 @@ def _load_system_prompt() -> str:
 
     candidates = [
         Path(os.environ.get("VEX_SYSTEM_PROMPT", "")),
+        Path(__file__).parent / "vex_system_prompt_v3.md",
         Path(__file__).parent / "vex_system_prompt_v2.md",
         Path(__file__).parent / "vex_system_prompt.md",
     ]
@@ -150,10 +259,18 @@ def _load_system_prompt() -> str:
             return _SYSTEM_PROMPT_CACHE
 
     logger.warning(
-        "vex_system_prompt_v2.md 를 찾을 수 없습니다. 내장 기본 프롬프트 사용."
+        "vex_system_prompt_v3.md 를 찾을 수 없습니다. 내장 기본 프롬프트 사용."
     )
     _SYSTEM_PROMPT_CACHE = _DEFAULT_SYSTEM_PROMPT
     return _SYSTEM_PROMPT_CACHE
+
+
+def _gemini_prompt_file() -> Path:
+    """Prompt file referenced with Gemini CLI's @file syntax."""
+    configured = os.environ.get("VEX_GEMINI_PROMPT_FILE")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path(__file__).parent / "vex_system_prompt_v3.md").resolve()
 
 
 # 시스템 프롬프트 파일이 없을 경우 사용할 최소 내장 프롬프트
@@ -171,14 +288,8 @@ rootfs 환경에서 도달 가능(Reachable)한지를 3단계로 체계적으로
 분석 환경 특이사항:
 - 분석 대상은 임베디드 펌웨어 rootfs (MIPS/ARM 아키텍처 등)
 - 호스트에서 정적 분석 (nm, readelf, strings, file 등 사용)
-- 파일 권한이 보존되지 않을 수 있으므로 ELF 매직바이트(\x7fELF) 기반 탐지 필수
+- 파일 권한이 보존되지 않을 수 있으므로 ELF 매직바이트(\\x7fELF) 기반 탐지 필수
 - -executable, -perm +x 등 권한 기반 탐지 옵션 사용 금지
-
-응답 규칙:
-- 한 번에 하나의 단계 명령어만 제공 (단계별 순차 분석)
-- 명령어는 반드시 ```bash 코드블록으로 제공
-- 최종 판단이 완료되면 OpenVEX JSON을 ```json 코드블록으로 응답에 포함
-- OpenVEX JSON 컨텍스트: https://openvex.dev/ns/v0.2.0
 
 VEX 상태값:
 - not_affected / vulnerable_code_not_present: 라이브러리에 취약 코드 없음
@@ -187,253 +298,12 @@ VEX 상태값:
 - affected: 1~3단계 모두 취약 조건 충족
 - under_investigation: 결론이 불분명하여 추가 분석 필요
 
+최종 응답에는 분석 요약 보고서와 OpenVEX JSON을 포함해. OpenVEX JSON은
+반드시 ```json 코드블록 안에 출력하고, @context는
+"https://openvex.dev/ns/v0.2.0" 를 사용해.
+
 한국어로 응답해주세요.
 """
-
-
-# ---------------------------------------------------------------------------
-# Command extraction
-# ---------------------------------------------------------------------------
-
-
-def extract_commands_from_response(response: str) -> list[str]:
-    """
-    Gemini 응답의 ```bash 코드블록에서 실행할 스크립트를 추출합니다.
-
-    규칙:
-    - ```bash 또는 ```sh 블록 하나를 스크립트 하나로 취급
-    - 블록 내 주석(#), 빈 줄은 그대로 유지 (bash가 처리)
-    - 멀티라인 while/if/for 구문을 줄 단위로 쪼개지 않음
-    """
-    commands: list[str] = []
-    block_re = re.compile(r"```(?:bash|sh)\n(.*?)```", re.DOTALL)
-
-    for match in block_re.finditer(response):
-        script = match.group(1).strip()
-        if script:
-            commands.append(script)
-
-    return commands
-
-
-# ---------------------------------------------------------------------------
-# Security check
-# ---------------------------------------------------------------------------
-
-
-def _check_command_safety(cmd: str) -> tuple[bool, Optional[str]]:
-    """
-    명령어가 안전한지 검사합니다.
-
-    Returns
-    -------
-    (is_safe, block_reason)
-    """
-    for pattern, reason in _BLACKLIST_PATTERNS:
-        if pattern.search(cmd):
-            return False, reason
-    return True, None
-
-
-# ---------------------------------------------------------------------------
-# Command execution in rootfs
-# ---------------------------------------------------------------------------
-
-
-async def execute_command_in_rootfs(
-    cmd: str,
-    rootfs_path: str,
-) -> CommandResult:
-    """
-    rootfs_path를 cwd로 설정하여 명령어를 실행합니다.
-
-    Parameters
-    ----------
-    cmd:
-        실행할 shell 명령어.
-    rootfs_path:
-        rootfs 디렉토리 경로 (cwd로 사용). str 타입.
-
-    Returns
-    -------
-    CommandResult
-        실행 결과. blocked=True 이면 보안 차단된 명령어.
-    """
-    # ── 보안 검사 ─────────────────────────────────────────────────────────
-    is_safe, block_reason = _check_command_safety(cmd)
-    if not is_safe:
-        logger.warning("[VEX] 명령어 차단: %.80s ← %s", cmd, block_reason)
-        return CommandResult(
-            command=cmd,
-            stdout="",
-            stderr=f"[보안 차단] {block_reason}",
-            returncode=-1,
-            elapsed=0.0,
-            blocked=True,
-            block_reason=block_reason,
-        )
-
-    # ── rootfs 경로 존재 확인 ─────────────────────────────────────────────
-    if not Path(rootfs_path).exists():
-        return CommandResult(
-            command=cmd,
-            stdout="",
-            stderr=f"[오류] rootfs 경로 없음: {rootfs_path}",
-            returncode=-1,
-            elapsed=0.0,
-        )
-
-    start = time.monotonic()
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=rootfs_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # 분석 도구(nm, strings, readelf, find, grep, file, head)만 허용
-            env={
-                "PATH": "/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin",
-                "HOME": "/tmp",
-                "LANG": "C",
-                "LC_ALL": "C",
-            },
-        )
-    except OSError as exc:
-        return CommandResult(
-            command=cmd,
-            stdout="",
-            stderr=f"[실행 오류] {exc}",
-            returncode=-1,
-            elapsed=time.monotonic() - start,
-        )
-
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=COMMAND_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return CommandResult(
-            command=cmd,
-            stdout="",
-            stderr=f"[타임아웃] {COMMAND_TIMEOUT}초 초과",
-            returncode=-1,
-            elapsed=time.monotonic() - start,
-        )
-
-    return CommandResult(
-        command=cmd,
-        stdout=stdout_b.decode(errors="replace"),
-        stderr=stderr_b.decode(errors="replace"),
-        returncode=proc.returncode or 0,
-        elapsed=time.monotonic() - start,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Gemini caller (CLI headless 모드, 매 턴 단일 호출)
-# ---------------------------------------------------------------------------
-
-# 히스토리 슬라이딩 윈도우: 최근 N턴만 전달 (시스템프롬프트 + 이전 대화 크기 제한)
-HISTORY_WINDOW = int(os.environ.get("VEX_HISTORY_WINDOW", "8"))  # 최근 8개 메시지 (4턴)
-
-
-def _serialize_history_for_cli(history: list[dict]) -> str:
-    """대화 히스토리를 gemini CLI stdin 형식으로 직렬화합니다. (슬라이딩 윈도우 적용)"""
-    # 슬라이딩 윈도우: 가장 최근 HISTORY_WINDOW 개 메시지만 사용
-    windowed = history[-HISTORY_WINDOW:] if len(history) > HISTORY_WINDOW else history
-    parts = []
-    for msg in windowed:
-        role = "User" if msg["role"] == "user" else "Assistant"
-        parts.append(f"[{role}]: {msg['content']}")
-    return "\n\n".join(parts)
-
-
-async def call_gemini(
-    history: list[dict],
-    new_message: str,
-    cve_id: str,
-    turn: int,
-) -> str:
-    """
-    gemini CLI를 headless 모드(-p)로 호출하여 응답을 반환합니다.
-
-    히스토리를 stdin으로 전달하고 새 메시지를 -p 인자로 넘깁니다.
-    슬라이딩 윈도우를 적용해 최근 HISTORY_WINDOW 개 메시지만 전송합니다.
-    """
-    gemini_bin = shutil.which("gemini")
-    if not gemini_bin:
-        raise RuntimeError(
-            "gemini CLI를 찾을 수 없습니다.\n"
-            "  설치: npm install -g @google/gemini-cli\n"
-            "  로그인: gemini  (첫 실행 시 Google 계정 인증)"
-        )
-
-    # stdin: 기존 대화 히스토리 (슬라이딩 윈도우)
-    stdin_text = _serialize_history_for_cli(history) if history else ""
-    stdin_bytes = stdin_text.encode("utf-8") if stdin_text else None
-
-    deadline = time.monotonic() + GEMINI_TIMEOUT
-    heartbeat_logged_at = time.monotonic()
-
-    logger.info("[VEX] %s Turn %d — gemini 호출 (히스토리 %d개 메시지, 창 %d개)",
-                cve_id, turn, len(history), min(len(history), HISTORY_WINDOW))
-
-    proc = await asyncio.create_subprocess_exec(
-        gemini_bin,
-        "--model", GEMINI_MODEL,
-        "--yolo",
-        "-p", new_message,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    # heartbeat 로그를 찍으면서 응답 대기
-    async def _wait_with_heartbeat():
-        nonlocal heartbeat_logged_at
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                raise RuntimeError(f"gemini 응답 타임아웃 ({GEMINI_TIMEOUT}초)")
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(input=stdin_bytes),
-                    timeout=min(30.0, remaining),
-                )
-                return stdout_b, stderr_b
-            except asyncio.TimeoutError:
-                now = time.monotonic()
-                total_waited = now - (deadline - GEMINI_TIMEOUT)
-                logger.info("[VEX] %s Turn %d — Gemini 응답 대기 중... (%.0fs 경과)",
-                            cve_id, turn, total_waited)
-                heartbeat_logged_at = now
-                stdin_bytes_ref = None  # communicate는 한 번만 가능 → 재시도 불가
-
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(input=stdin_bytes),
-            timeout=GEMINI_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(f"gemini 응답 타임아웃 ({GEMINI_TIMEOUT}초)")
-
-    response = stdout_b.decode("utf-8", errors="replace").strip()
-
-    if proc.returncode != 0 and not response:
-        stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
-        err_msg = stderr_text or f"종료 코드 {proc.returncode}"
-        if "429" in err_msg or "quota exceeded" in err_msg.lower():
-            raise RuntimeError(f"[RATE_LIMIT] {err_msg}")
-        raise RuntimeError(f"gemini 오류: {err_msg}")
-
-    logger.info("[VEX] %s Turn %d — 응답 수신 (%d chars)", cve_id, turn, len(response))
-    return response
 
 
 # ---------------------------------------------------------------------------
@@ -449,8 +319,9 @@ def extract_json_from_response(response: str) -> Optional[dict]:
     1. ```json 코드블록 내 JSON
     2. 응답 전체에서 { ... } 직접 파싱 (openvex.dev 컨텍스트 존재 여부로 검증)
     """
-    # 1. ```json 코드블록
-    for match in re.finditer(r"```json\n(.*?)```", response, re.DOTALL):
+    variants = (response, _strip_tui_line_numbers(response))
+
+    for match in re.finditer(r"```json\n(.*?)```", variants[0], re.DOTALL):
         try:
             data = json.loads(match.group(1))
             if _is_openvex(data):
@@ -458,16 +329,33 @@ def extract_json_from_response(response: str) -> Optional[dict]:
         except json.JSONDecodeError:
             continue
 
-    # 2. 응답 내 raw JSON 오브젝트 탐색 (greedy → 가장 큰 블록 우선)
-    for match in re.finditer(r"\{[\s\S]*\}", response):
-        try:
-            data = json.loads(match.group(0))
-            if _is_openvex(data):
-                return data
-        except json.JSONDecodeError:
-            continue
+    for text in variants[1:]:
+        for match in re.finditer(r"```json\n(.*?)```", text, re.DOTALL):
+            try:
+                data = json.loads(match.group(1))
+                if _is_openvex(data):
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+    for text in variants:
+        for match in re.finditer(r"\{[\s\S]*\}", text):
+            try:
+                data = json.loads(match.group(0))
+                if _is_openvex(data):
+                    return data
+            except json.JSONDecodeError:
+                continue
 
     return None
+
+
+def _strip_tui_line_numbers(text: str) -> str:
+    """Remove Gemini TUI-rendered code block line numbers before JSON parsing."""
+    return "\n".join(
+        re.sub(r"^\s*\d+\s(?=[\{\}\[\]\",A-Za-z_@-])", "", line)
+        for line in text.splitlines()
+    )
 
 
 def _is_openvex(data: dict) -> bool:
@@ -476,59 +364,8 @@ def _is_openvex(data: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Formatting helpers
+# VEX statement extraction
 # ---------------------------------------------------------------------------
-
-
-def _format_results_for_gemini(
-    commands: list[str],
-    results: list[CommandResult],
-) -> str:
-    """명령어 실행 결과를 Gemini 다음 턴 메시지로 포맷합니다."""
-    parts: list[str] = ["다음은 명령어 실행 결과입니다:\n"]
-
-    for cmd, result in zip(commands, results):
-        parts.append(f"```\n$ {cmd}\n```")
-        if result.blocked:
-            parts.append(f"> [보안 차단됨] {result.block_reason}\n")
-            continue
-
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-        rc = result.returncode
-
-        # 타임아웃 명시적 처리
-        if rc == -1 and "[타임아웃]" in stderr:
-            parts.append(
-                f"> ⏱ 명령 타임아웃 ({COMMAND_TIMEOUT}초 초과): 전수 조사 명령이 너무 오래 걸렸습니다.\n"
-                f"> 더 좁은 범위를 대상으로 하는 명령으로 대체하거나,\n"
-                f"> find 결과를 특정 디렉토리(usr/lib, usr/bin 등)로 한정해주세요.\n"
-            )
-            parts.append(f"> 실행 시간: {result.elapsed:.2f}s\n")
-            continue
-
-        # 셸 오류(rc=1,2 등)는 명확히 표시
-        if rc not in (0, None) and not stdout:
-            err_detail = stderr[:500] if stderr else f"종료 코드 {rc} (출력 없음)"
-            parts.append(f"> ⚠ 명령 실패 (rc={rc}): {err_detail}")
-            parts.append(f"> 실행 시간: {result.elapsed:.2f}s\n")
-            continue
-
-        combined = stdout or stderr or "(출력 없음 — 검색 결과 없음. 조건에 맞는 항목이 존재하지 않음을 의미합니다)"
-        if len(combined) > MAX_CMD_OUTPUT_CHARS:
-            combined = combined[:MAX_CMD_OUTPUT_CHARS] + "\n... (이하 생략됨)"
-
-        parts.append(f"```\n{combined}\n```")
-        if rc not in (0, None):
-            parts.append(f"> 종료 코드: {rc}\n")
-        parts.append(f"> 실행 시간: {result.elapsed:.2f}s\n")
-
-    parts.append(
-        "\n위 결과를 바탕으로 분석을 계속 진행해주세요. "
-        "다음 분석 단계의 명령어가 필요하면 ```bash 블록으로 제공하고, "
-        "충분한 증거가 모였으면 OpenVEX JSON을 생성해주세요."
-    )
-    return "\n".join(parts)
 
 
 def _extract_statement_from_vex(
@@ -557,7 +394,371 @@ def _extract_statement_from_vex(
 
 
 # ---------------------------------------------------------------------------
-# Core: multi-turn VEX analysis loop
+# Gemini CLI autonomous invocation
+# ---------------------------------------------------------------------------
+
+
+def _build_gemini_yolo_prompt(
+    cve_id: str,
+    product_info: dict,
+) -> str:
+    """Build the task prompt sent to Gemini CLI.
+
+    System instructions come from GEMINI.md which gemini auto-loads as project
+    context.  This prompt only carries the task-specific parameters.
+    """
+    product_name = product_info.get("name", "unknown_product")
+    product_version = product_info.get("version", "unknown")
+
+    return (
+        f"@GEMINI.md 의 규칙을 엄격히 적용해서 {cve_id} 분석을 시작해. "
+        f"대상 제품: {product_name} {product_version}. "
+        "중간에 나에게 실행 여부나 결과를 묻지 말고, 네가 직접 내부 쉘(Shell) "
+        "도구를 호출해서 명령어를 실행하고 그 결과 로그를 파싱하는 과정을 "
+        "리포트가 완성될 때까지 무인 에이전트(Autonomous Agent) 모드로 끝까지 진행해."
+    )
+
+
+async def stream_gemini_yolo(
+    prompt: str,
+    rootfs_path: Path,
+    cve_id: str,
+    model: str = GEMINI_MODEL,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Run Gemini CLI with --yolo in rootfs_path and stream progress events.
+
+    When GEMINI_OUTPUT_FORMAT is stream-json, each stdout line is a JSON object.
+    We parse those lines to extract:
+      - assistant message content  → progress log + OpenVEX detection
+      - tool_call (shell commands) → progress log showing what gemini is running
+      - tool_result                → progress log showing command output
+      - init                       → session info log
+      - user message               → skipped (echo of our prompt)
+
+    Yields stage_progress events, then a sentinel:
+      {"type": "_gemini_response", "response": <extracted assistant content>}
+    """
+    gemini_bin = shutil.which("gemini")
+    if not gemini_bin:
+        raise RuntimeError(
+            "gemini CLI not found. Install it with: npm install -g @google/gemini-cli"
+        )
+
+    if not rootfs_path.exists():
+        raise RuntimeError(f"rootfs path does not exist: {rootfs_path}")
+
+    use_stream_json = GEMINI_OUTPUT_FORMAT in {"json", "stream-json"}
+    model_label = model if model.lower() not in {"auto", "default"} else "auto"
+    logger.info(
+        "[VEX] %s invoking gemini model=%s --yolo in %s (output-format=%s)",
+        cve_id, model_label, rootfs_path, GEMINI_OUTPUT_FORMAT,
+    )
+
+    proc = await asyncio.create_subprocess_exec(
+        *_gemini_process_args(gemini_bin, prompt.strip(), model),
+        cwd=str(rootfs_path),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_setup_gemini_subprocess,
+    )
+    _ACTIVE_GEMINI_PROCS.add(proc)
+
+    started_at = time.monotonic()
+    deadline = started_at + GEMINI_TIMEOUT
+
+    # assistant_content_parts: extracted assistant text (used as final response)
+    # For plain-text mode this equals the full stdout; for stream-json it's only
+    # the content fields from assistant/model messages.
+    assistant_content_parts: list[str] = []
+    # Buffer for assistant message chunks — flushed when a non-message event
+    # arrives (tool_call, tool_result, done) so we emit one log per "thought"
+    # instead of one per streaming delta.
+    _pending_assistant: list[str] = []
+    stderr_parts: list[str] = []
+    progress_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    final_detected = False
+    final_event = asyncio.Event()
+
+    async def _flush_assistant_buffer() -> None:
+        """Emit buffered assistant text as a single progress event."""
+        if not _pending_assistant:
+            return
+        combined = "".join(_pending_assistant)
+        _pending_assistant.clear()
+        compact = " ".join(combined.split())
+        if not compact:
+            return
+        if len(compact) > GEMINI_STREAM_LOG_CHARS:
+            compact = compact[:GEMINI_STREAM_LOG_CHARS] + "..."
+        logger.info("[VEX] %s assistant: %s", cve_id, compact)
+        await progress_q.put({
+            "type": "stage_progress", "stage": "vex_analyzing",
+            "log": f"[{cve_id}] {compact}",
+        })
+
+    # ── stream-json stdout parser ─────────────────────────────────────────
+
+    async def _handle_json_line(line: str) -> None:
+        """Parse one stream-json line and enqueue a progress event if relevant."""
+        nonlocal final_detected
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            # Not a JSON line — treat as plain text (shouldn't happen in json mode)
+            text = _strip_ansi(line).strip()
+            if text:
+                assistant_content_parts.append(text + "\n")
+                await progress_q.put({
+                    "type": "stage_progress", "stage": "vex_analyzing",
+                    "log": f"[{cve_id}] {text[:GEMINI_STREAM_LOG_CHARS]}",
+                })
+            return
+
+        obj_type = obj.get("type", "")
+
+        if obj_type == "init":
+            m = obj.get("model", "?")
+            logger.info("[VEX] %s Gemini session started: model=%s", cve_id, m)
+            await progress_q.put({
+                "type": "stage_progress", "stage": "vex_analyzing",
+                "log": f"[{cve_id}] Gemini session started (model: {m})",
+            })
+
+        elif obj_type == "message":
+            role = obj.get("role", "")
+            if role == "user":
+                return  # skip echo of our own prompt
+
+            content = obj.get("content", "")
+            # content may be a list of parts (multimodal)
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict)
+                )
+            if not isinstance(content, str) or not content:
+                return
+
+            assistant_content_parts.append(content)
+            _pending_assistant.append(content)
+            # OpenVEX JSON detection from accumulated assistant content
+            if not final_detected and GEMINI_CLI_MODE != "headless":
+                if extract_json_from_response("".join(assistant_content_parts)) is not None:
+                    final_detected = True
+                    final_event.set()
+                    await _flush_assistant_buffer()
+                    await progress_q.put({
+                        "type": "stage_progress", "stage": "vex_analyzing",
+                        "log": f"[{cve_id}] OpenVEX JSON detected; stopping Gemini",
+                    })
+                    asyncio.create_task(
+                        _terminate_process_group(proc, cve_id, "OpenVEX complete")
+                    )
+
+        elif obj_type in ("tool_call", "tool_use"):
+            # Flush any buffered assistant text before showing the tool call
+            await _flush_assistant_buffer()
+            tool = obj.get("tool", obj.get("name", ""))
+            inp = obj.get("input", obj.get("parameters", {}))
+            if isinstance(inp, dict):
+                cmd = inp.get("command", inp.get("cmd", ""))
+                log_msg = f"[{cve_id}] $ {cmd[:300]}" if cmd else \
+                          f"[{cve_id}] tool:{tool}({str(inp)[:200]})"
+            else:
+                log_msg = f"[{cve_id}] tool:{tool}"
+            logger.info("[VEX] %s %s", cve_id, log_msg)
+            await progress_q.put({
+                "type": "stage_progress", "stage": "vex_analyzing",
+                "log": log_msg,
+            })
+
+        elif obj_type in ("tool_result", "function_result"):
+            output = obj.get("output", obj.get("result", ""))
+            if isinstance(output, str) and output.strip():
+                compact = " ".join(output.strip().split())[:400]
+                if compact:
+                    await progress_q.put({
+                        "type": "stage_progress", "stage": "vex_analyzing",
+                        "log": f"[{cve_id}] → {compact}",
+                    })
+
+        elif obj_type == "error":
+            await _flush_assistant_buffer()
+            err = obj.get("message", obj.get("error", str(obj)))
+            if _is_gemini_rate_limit(str(err)):
+                raise RuntimeError(f"[RATE_LIMIT] {err}")
+            await progress_q.put({
+                "type": "stage_progress", "stage": "vex_analyzing",
+                "log": f"[{cve_id}] Gemini error: {err}",
+            })
+        # Other types (usage, done, heartbeat, …) are silently ignored.
+
+    # ── stdout reader ─────────────────────────────────────────────────────
+
+    async def _read_stdout(stream: asyncio.StreamReader | None) -> None:
+        nonlocal final_detected
+        if stream is None:
+            return
+        if use_stream_json:
+            # Line-buffered JSON parsing
+            buf = ""
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    # Flush remaining line buffer
+                    if buf.strip():
+                        await _handle_json_line(buf.strip())
+                    # Flush any remaining assistant text buffer
+                    await _flush_assistant_buffer()
+                    return
+                buf += chunk.decode("utf-8", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        await _handle_json_line(line)
+                    if final_detected:
+                        return  # terminate early after OpenVEX detected
+        else:
+            # Plain-text mode: strip ANSI, accumulate, detect OpenVEX
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    return
+                text = _strip_ansi(chunk.decode("utf-8", errors="replace"))
+                if not text:
+                    continue
+                assistant_content_parts.append(text)
+                compact = " ".join(text.split())
+                if compact:
+                    if len(compact) > GEMINI_STREAM_LOG_CHARS:
+                        compact = compact[:GEMINI_STREAM_LOG_CHARS] + "..."
+                    logger.info("[VEX] %s stdout: %s", cve_id, compact)
+                    await progress_q.put({
+                        "type": "stage_progress", "stage": "vex_analyzing",
+                        "log": f"[{cve_id}] {compact}",
+                    })
+                if not final_detected and GEMINI_CLI_MODE != "headless":
+                    if extract_json_from_response("".join(assistant_content_parts)) is not None:
+                        final_detected = True
+                        final_event.set()
+                        await progress_q.put({
+                            "type": "stage_progress", "stage": "vex_analyzing",
+                            "log": f"[{cve_id}] OpenVEX JSON detected; stopping Gemini",
+                        })
+                        asyncio.create_task(
+                            _terminate_process_group(proc, cve_id, "OpenVEX complete")
+                        )
+                        return
+
+    # ── stderr reader ─────────────────────────────────────────────────────
+
+    async def _read_stderr(stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            text = _strip_ansi(chunk.decode("utf-8", errors="replace"))
+            if not text:
+                continue
+            stderr_parts.append(text)
+            # Filter out noisy but expected startup banners
+            if "YOLO mode is enabled" in text:
+                continue
+            compact = " ".join(text.split())
+            if not compact:
+                continue
+            if len(compact) > GEMINI_STREAM_LOG_CHARS:
+                compact = compact[:GEMINI_STREAM_LOG_CHARS] + "..."
+            logger.info("[VEX] %s stderr: %s", cve_id, compact)
+            await progress_q.put({
+                "type": "stage_progress", "stage": "vex_analyzing",
+                "log": f"[{cve_id}] stderr: {compact}",
+            })
+            if _is_gemini_rate_limit(text):
+                await progress_q.put({
+                    "type": "stage_progress", "stage": "vex_analyzing",
+                    "log": f"[{cve_id}] Gemini capacity/rate limit detected",
+                })
+                await _terminate_process_group(proc, cve_id, "gemini rate limit")
+                return
+
+    stdout_task = asyncio.create_task(_read_stdout(proc.stdout))
+    stderr_task = asyncio.create_task(_read_stderr(proc.stderr))
+    wait_task = asyncio.create_task(proc.wait())
+
+    try:
+        while True:
+            if wait_task.done() and progress_q.empty():
+                break
+            if final_event.is_set() and progress_q.empty():
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await _terminate_process_group(proc, cve_id, "timeout")
+                raise RuntimeError(f"gemini CLI timed out after {GEMINI_TIMEOUT}s")
+
+            timeout = 1.0 if final_event.is_set() else min(max(1, GEMINI_HEARTBEAT_INTERVAL), remaining)
+            try:
+                yield await asyncio.wait_for(progress_q.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                if final_event.is_set():
+                    break
+                elapsed = int(time.monotonic() - started_at)
+                logger.info("[VEX] %s Gemini CLI still running (%ss elapsed)", cve_id, elapsed)
+                yield {
+                    "type": "stage_progress",
+                    "stage": "vex_analyzing",
+                    "log": f"[{cve_id}] Gemini CLI still running ({elapsed}s elapsed)",
+                }
+
+        if final_event.is_set() and not wait_task.done():
+            try:
+                await asyncio.wait_for(wait_task, timeout=5)
+            except asyncio.TimeoutError:
+                await _terminate_process_group(proc, cve_id, "OpenVEX complete force kill")
+
+        for task in (stdout_task, stderr_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+        # response = accumulated assistant content (not raw stdout JSON)
+        response = "".join(assistant_content_parts).strip()
+        stderr_text = "".join(stderr_parts).strip()
+
+        if proc.returncode != 0 and not response:
+            if _is_gemini_rate_limit(stderr_text):
+                raise RuntimeError(f"[RATE_LIMIT] {stderr_text}")
+            raise RuntimeError(stderr_text or f"gemini exited with code {proc.returncode}")
+
+        if _is_gemini_rate_limit(stderr_text):
+            raise RuntimeError(f"[RATE_LIMIT] {stderr_text}")
+
+        logger.info("[VEX] %s gemini response received (%d chars)", cve_id, len(response))
+        yield {"type": "_gemini_response", "response": response}
+    except asyncio.CancelledError:
+        await _terminate_process_group(proc, cve_id, "cancelled")
+        stdout_task.cancel()
+        stderr_task.cancel()
+        wait_task.cancel()
+        raise
+    except Exception:
+        await _terminate_process_group(proc, cve_id, "error")
+        stdout_task.cancel()
+        stderr_task.cancel()
+        wait_task.cancel()
+        raise
+    finally:
+        _ACTIVE_GEMINI_PROCS.discard(proc)
+
+
+# ---------------------------------------------------------------------------
+# Core: single-shot VEX analysis loop (Gemini runs tools autonomously)
 # ---------------------------------------------------------------------------
 
 
@@ -568,212 +769,140 @@ async def run_vex_analysis_loop(
     output_dir: Path,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
-    단일 CVE에 대한 멀티턴 VEX 분석 루프.
+    Analyze one CVE by delegating shell/tool execution to Gemini CLI itself.
 
-    Parameters
-    ----------
-    cve_id:
-        분석할 CVE ID (예: "CVE-2021-44228").
-    rootfs_path:
-        extractor.py가 탐지한 rootfs 디렉토리.
-    product_info:
-        {"name": str, "version": str} 형태의 제품 정보.
-    output_dir:
-        분석 결과 저장 디렉토리 (예: storage/{job_id}/vex/).
+    Gemini is invoked with --yolo and cwd=rootfs_path so it can autonomously
+    run find/nm/readelf/strings/grep commands through its built-in Shell tool.
+    The backend streams stdout/stderr as stage_progress events, then parses the
+    final OpenVEX JSON from the accumulated response.
 
     Yields
     ------
-    {"type": "gemini_response", "turn": int, "content": str}
-    {"type": "executing_command", "command": str}
-    {"type": "command_result", "command": str, "result": str, "returncode": int, "blocked": bool}
-    {"type": "vex_complete", "vex_document": dict, "vex_path": str, "statement": VexStatement}
+    {"type": "stage_progress", "stage": "vex_analyzing", "log": str}
+    {"type": "vex_complete", "cve_id": str, "status": str, "vex_document": dict,
+     "vex_path": str, "statement": VexStatement, "report_text": str, "report_path": str|None}
     {"type": "error", "message": str}
-    {"type": "max_turns_reached", "cve_id": str}
+    {"type": "max_turns_reached", "cve_id": str}   # when no OpenVEX JSON found
     """
-    system_prompt = _load_system_prompt()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    product_name = product_info.get("name", "unknown_product")
-    product_version = product_info.get("version", "unknown")
+    prompt = _build_gemini_yolo_prompt(cve_id, product_info)
+    yield {
+        "type": "stage_progress",
+        "stage": "vex_analyzing",
+        "log": f"[{cve_id}] Gemini CLI --yolo analysis started (models: {', '.join(GEMINI_MODELS)})",
+    }
 
-    # ── 초기 사용자 메시지 ────────────────────────────────────────────────
-    initial_message = (
-        f"{cve_id} 취약점을 분석해줘.\n\n"
-        f"대상 제품: {product_name} {product_version}\n"
-        f"rootfs 위치: {rootfs_path}  (모든 명령어는 이 디렉토리를 cwd로 실행됨)\n\n"
-        "이 rootfs에서 해당 CVE가 실제로 Exploitable한지 단계별로 분석해줘. "
-        "먼저 1단계-A 명령어부터 시작해줘."
-    )
+    response: Optional[str] = None
+    last_rate_limit_error: Optional[str] = None
+    retry_cycles = max(1, GEMINI_MODEL_RETRY_CYCLES)
 
-    # ── 대화 히스토리 (시스템 프롬프트 포함, 슬라이딩 윈도우로 전달) ─────
-    # 첫 메시지: 시스템 프롬프트를 시스템 역할로 삽입
-    history: list[dict] = [
-        {"role": "user", "content": f"[시스템 지시사항]\n{system_prompt.strip()}"},
-        {"role": "assistant", "content": "네, 이해했습니다. 분석을 시작하겠습니다."},
-        {"role": "user", "content": initial_message},
-    ]
-
-    for turn in range(MAX_TURNS):
-        # 현재 턴의 새 메시지 (히스토리의 마지막 user 메시지)
-        new_message = history[-1]["content"]
-        # 전달할 히스토리는 마지막 메시지 제외 (call_gemini 내부에서 슬라이딩 윈도우 적용)
-        history_ctx = history[:-1]
-
-        logger.info("[VEX] %s Turn %d — Gemini 호출", cve_id, turn + 1)
-        yield {"type": "stage_progress", "stage": "vex_analyzing",
-               "log": f"🤖 [{cve_id}] Turn {turn + 1} — Gemini 응답 대기 중..."}
-
-        try:
-            response = await call_gemini(
-                history=history_ctx,
-                new_message=new_message,
-                cve_id=cve_id,
-                turn=turn + 1,
-            )
-        except Exception as exc:
-            msg = str(exc)
-            logger.error("[VEX] %s", msg)
-            # rate limit 재시도
-            if "[RATE_LIMIT]" in msg:
-                backoff = _RATE_LIMIT_BACKOFF[min(turn, len(_RATE_LIMIT_BACKOFF) - 1)]
-                logger.warning("[VEX] rate limit — %d초 대기 후 재시도", backoff)
-                yield {"type": "stage_progress", "stage": "vex_analyzing",
-                       "log": f"⚠ rate limit — {backoff}초 대기 후 재시도"}
-                await asyncio.sleep(backoff)
-                try:
-                    response = await call_gemini(
-                        history=history_ctx,
-                        new_message=new_message,
-                        cve_id=cve_id,
-                        turn=turn + 1,
-                    )
-                except Exception as exc2:
-                    yield {"type": "error", "message": f"Gemini 호출 실패 (Turn {turn + 1}): {exc2}"}
-                    return
-            else:
-                yield {"type": "error", "message": f"Gemini 호출 실패 (Turn {turn + 1}): {msg}"}
-                return
-
-        yield {"type": "gemini_response", "turn": turn + 1, "content": response}
-        logger.info("[VEX] %s Turn %d: %d chars", cve_id, turn + 1, len(response))
-
-        # 히스토리에 응답 추가
-        history.append({"role": "assistant", "content": response})
-
-        # 턴별 응답 파일 저장
-        (output_dir / f"{cve_id}_turn_{turn + 1}.md").write_text(
-            f"# {cve_id} — Turn {turn + 1}\n\n{response}\n",
-            encoding="utf-8",
-        )
-
-        # ── OpenVEX JSON 감지 → 완료 ─────────────────────────────────
-        if "openvex.dev" in response:
-            vex_doc = extract_json_from_response(response)
-            if vex_doc:
-                statement = _extract_statement_from_vex(cve_id, vex_doc, turn + 1)
-                report_text = _extract_report_text(response)
-                statement.report_text = report_text
-
-                vex_path = output_dir / f"{cve_id}_vex.json"
-                vex_path.write_text(
-                    json.dumps(vex_doc, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                report_path = output_dir / f"{cve_id}_report.md"
-                if report_text:
-                    report_path.write_text(
-                        f"# {cve_id} 분석 요약 보고서\n\n{report_text}\n",
-                        encoding="utf-8",
-                    )
-                    logger.info("[VEX] 분석 보고서 저장: %s", report_path.name)
-
-                _save_analysis_summary(
-                    cve_id=cve_id,
-                    product_info=product_info,
-                    history=history,
-                    statement=statement,
-                    output_dir=output_dir,
-                )
-                yield {
-                    "type": "vex_complete",
-                    "cve_id": cve_id,
-                    "status": statement.status,
-                    "report_text": report_text,
-                    "report_path": str(report_path) if report_text else None,
-                    "vex_document": vex_doc,
-                    "vex_path": str(vex_path),
-                    "statement": statement,
-                }
-                return
-
-        # ── bash 명령어 추출 및 실행 ─────────────────────────────────
-        commands = extract_commands_from_response(response)
-
-        if not commands:
-            next_user_msg = (
-                "응답에 ```bash 코드블록 명령어가 포함되지 않았습니다. "
-                "다음 분석 단계의 명령어를 ```bash 블록으로 제공해주세요. "
-                "또는 분석이 완료되었다면 OpenVEX JSON을 ```json 블록으로 출력해주세요."
-            )
-            history.append({"role": "user", "content": next_user_msg})
-            continue
-
-        cmd_results: list[CommandResult] = []
-        for cmd in commands:
-            yield {"type": "executing_command", "command": cmd}
-            result = await execute_command_in_rootfs(cmd, str(rootfs_path))
-
-            full_out = (result.stdout or "").strip()
-            if result.blocked:
-                logger.info("[VEX CMD] 차단: %s", cmd[:100])
-            elif result.returncode not in (0, None) and not full_out:
-                logger.info("[VEX CMD] 실패 (rc=%d): %s",
-                            result.returncode, (result.stderr or "")[:200])
-            else:
-                lines = full_out.splitlines()
-                logger.info("[VEX CMD] rc=%d, %d줄 출력:", result.returncode, len(lines))
-                for line in lines:
-                    logger.info("[VEX OUT] %s", line)
-                if not lines:
-                    logger.info("[VEX OUT] (출력 없음)")
-
+    for cycle in range(retry_cycles):
+        for model in GEMINI_MODELS:
             yield {
-                "type": "command_result",
-                "command": cmd,
-                "result": result.stdout[:2000],
-                "returncode": result.returncode,
-                "blocked": result.blocked,
+                "type": "stage_progress",
+                "stage": "vex_analyzing",
+                "log": f"[{cve_id}] Gemini model attempt: {model}",
             }
-            cmd_results.append(result)
+            try:
+                async for event in stream_gemini_yolo(prompt, rootfs_path, cve_id, model):
+                    if event.get("type") == "_gemini_response":
+                        response = event["response"]
+                    else:
+                        yield event
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if "[RATE_LIMIT]" in msg:
+                    last_rate_limit_error = msg
+                    yield {
+                        "type": "stage_progress",
+                        "stage": "vex_analyzing",
+                        "log": f"[{cve_id}] Gemini capacity/rate limit on {model}; trying next model",
+                    }
+                    continue
+                yield {"type": "error", "message": f"Gemini CLI failed: {msg}"}
+                return
 
-        # ── 다음 턴 메시지 (명령어 결과 전송) ────────────────────────
-        next_user_msg = _format_results_for_gemini(commands, cmd_results)
-        history.append({"role": "user", "content": next_user_msg})
+        if response is not None:
+            break
 
-    # ── 최대 턴 초과: under_investigation으로 마무리 ───────────────────────
-    logger.warning("[VEX] %s 최대 턴(%d) 도달, under_investigation 처리", cve_id, MAX_TURNS)
-    yield {"type": "max_turns_reached", "cve_id": cve_id}
+        if cycle < retry_cycles - 1:
+            backoff = _RATE_LIMIT_BACKOFF[min(cycle, len(_RATE_LIMIT_BACKOFF) - 1)]
+            yield {
+                "type": "stage_progress",
+                "stage": "vex_analyzing",
+                "log": (
+                    f"[{cve_id}] All Gemini models are capacity/rate limited; "
+                    f"retrying after {backoff}s"
+                ),
+            }
+            await asyncio.sleep(backoff)
 
-    fallback_doc = _build_fallback_vex(cve_id, product_info)
-    vex_path = output_dir / f"{cve_id}_vex.json"
-    vex_path.write_text(
-        json.dumps(fallback_doc, ensure_ascii=False, indent=2),
+    if response is None and last_rate_limit_error:
+        yield {
+            "type": "error",
+            "message": f"Gemini CLI capacity/rate limit on all configured models: {last_rate_limit_error}",
+        }
+        return
+
+    if response is None:
+        yield {"type": "error", "message": "Gemini CLI finished without a response"}
+        return
+
+    # Save full raw response
+    response_path = output_dir / f"{cve_id}_gemini_yolo.md"
+    response_path.write_text(
+        f"# {cve_id} Gemini CLI --yolo analysis\n\n{response}\n",
         encoding="utf-8",
     )
-    fallback_stmt = VexStatement(
-        cve_id=cve_id,
-        status="under_investigation",
-        justification=None,
-        impact_statement=f"최대 분석 턴({MAX_TURNS})에 도달하여 결론이 나지 않았습니다. 수동 검토가 필요합니다.",
-        analysis_turns=MAX_TURNS,
+
+    vex_doc = extract_json_from_response(response)
+    if not vex_doc:
+        logger.warning("[VEX] %s no OpenVEX JSON found; using fallback", cve_id)
+        yield {"type": "max_turns_reached", "cve_id": cve_id}
+        vex_doc = _build_fallback_vex(cve_id, product_info)
+        statement = _extract_statement_from_vex(cve_id, vex_doc, 1)
+    else:
+        statement = _extract_statement_from_vex(cve_id, vex_doc, 1)
+
+    report_text = _extract_report_text(response)
+    statement.report_text = report_text
+
+    vex_path = output_dir / f"{cve_id}_vex.json"
+    vex_path.write_text(
+        json.dumps(vex_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+
+    report_path = output_dir / f"{cve_id}_report.md"
+    if report_text:
+        report_path.write_text(
+            f"# {cve_id} analysis report\n\n{report_text}\n",
+            encoding="utf-8",
+        )
+        logger.info("[VEX] 분석 보고서 저장: %s", report_path.name)
+
+    _save_analysis_summary(
+        cve_id=cve_id,
+        product_info=product_info,
+        history=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": response},
+        ],
+        statement=statement,
+        output_dir=output_dir,
+    )
+
     yield {
         "type": "vex_complete",
         "cve_id": cve_id,
-        "status": fallback_stmt.status,
-        "vex_document": fallback_doc,
+        "status": statement.status,
+        "report_text": report_text,
+        "report_path": str(report_path) if report_text else None,
+        "vex_document": vex_doc,
         "vex_path": str(vex_path),
-        "statement": fallback_stmt,
+        "statement": statement,
     }
 
 
@@ -802,14 +931,24 @@ async def analyze_cve_batch(
     total = len(cves)
     vex_dir = output_dir / "vex"
     vex_dir.mkdir(parents=True, exist_ok=True)
+    cancel_marker = output_dir / ".cancel_vex"
 
     yield {"type": "batch_start", "total": total}
     statements: list[VexStatement] = []
 
     for idx, cve_id in enumerate(cves, start=1):
+        if cancel_marker.exists():
+            yield {"type": "batch_cancelled", "message": "VEX analysis cancelled"}
+            return
+
         # CVE 간 딜레이: 첫 번째 CVE 이후부터 적용 (rate limit 방지)
         if idx > 1 and CVE_INTER_DELAY > 0:
             await asyncio.sleep(CVE_INTER_DELAY)
+
+        if cancel_marker.exists():
+            yield {"type": "batch_cancelled", "message": "VEX analysis cancelled"}
+            return
+
         progress_pct = round((idx - 1) / total * 100, 1)
         yield {
             "type": "cve_start",
@@ -830,6 +969,10 @@ async def analyze_cve_batch(
             yield event
             if event["type"] == "vex_complete":
                 last_statement = event.get("statement")
+
+        if cancel_marker.exists():
+            yield {"type": "batch_cancelled", "message": "VEX analysis cancelled"}
+            return
 
         if last_statement is None:
             last_statement = VexStatement(
@@ -883,12 +1026,10 @@ def _extract_report_text(response: str) -> str:
     Gemini 최종 응답에서 분석 요약 보고서 텍스트를 추출합니다.
     OpenVEX JSON 블록(```json ... ```) 이전의 텍스트가 보고서입니다.
     """
-    # ```json 블록이 시작되기 전까지의 텍스트
     json_block_start = response.find("```json")
     if json_block_start > 0:
         report = response[:json_block_start].strip()
     else:
-        # JSON 블록 없이 { 로 시작하는 raw JSON인 경우
         brace_start = response.find('{"@context"')
         if brace_start > 0:
             report = response[:brace_start].strip()
@@ -954,8 +1095,8 @@ def _build_fallback_vex(cve_id: str, product_info: dict) -> dict:
                 ],
                 "status": "under_investigation",
                 "impact_statement": (
-                    f"Automated VEX analysis reached maximum turn limit ({MAX_TURNS}) "
-                    "without a conclusive result. Manual review is required."
+                    "Automated VEX analysis did not produce a conclusive result. "
+                    "Manual review is required."
                 ),
             }
         ],
@@ -986,7 +1127,6 @@ def _build_combined_vex(
         # affected 상태에는 justification 미포함 (OpenVEX 스펙)
         if s.justification and s.status not in ("affected", "under_investigation"):
             stmt["justification"] = s.justification
-        # 분석 요약 보고서 포함 (확장 필드)
         if s.report_text:
             stmt["x_firmcore_report"] = s.report_text
         openvex_stmts.append(stmt)

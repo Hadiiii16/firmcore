@@ -12,7 +12,7 @@ export type JobStatus =
 // ── Job Summary (list view) ───────────────────────────────────────────────────
 
 export interface JobSummary {
-  id: string           // 백엔드 필드명
+  id: string
   filename: string
   product_name: string | null
   product_version: string | null
@@ -59,11 +59,11 @@ export interface SseEvent {
 // ── Pipeline Result ───────────────────────────────────────────────────────────
 
 export interface SbomComponent {
-  bom_ref: string
   name: string
   version: string
   type: string
   purl: string | null
+  licenses: string[]
 }
 
 export interface CveResult {
@@ -71,7 +71,8 @@ export interface CveResult {
   severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'NEGLIGIBLE' | 'UNKNOWN'
   package_name: string
   package_version: string
-  fixed_version: string | null
+  fix_version: string | null   // 백엔드 필드명: fix_version
+  urls: string[]
   description: string
   vex_status: string | null
   vex_justification: string | null
@@ -81,18 +82,37 @@ export interface CveResult {
 export interface StageTiming {
   stage: string
   started_at: string
+  completed_at: string | null
   elapsed_seconds: number | null
-  status: string
 }
 
 export interface JobResult {
-  job_id: string
-  status: JobStatus
+  id: string               // 백엔드 필드명: id
   filename: string
+  status: JobStatus
   product_name: string | null
   product_version: string | null
+
+  // SBOM
+  component_count: number
   sbom_components: SbomComponent[]
+
+  // CVE 집계
+  total_cves: number
+  critical_cves: number
+  high_cves: number
+  medium_cves: number
+  low_cves: number
+
+  // VEX 집계
+  not_affected_count: number
+  affected_count: number
+  under_investigation_count: number
+
+  // 상세 결과
   cve_results: CveResult[]
+  vex_document: Record<string, unknown> | null
+
   stage_timings: StageTiming[]
   created_at: string
   completed_at: string | null

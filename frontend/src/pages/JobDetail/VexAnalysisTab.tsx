@@ -97,9 +97,9 @@ export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus 
               </div>
             )}
 
-            {cve.fixed_version && (
+            {cve.fix_version && (
               <p className="text-xs font-mono text-gray-500">
-                Fixed in: <span className="text-accent-green">{cve.fixed_version}</span>
+                Fixed in: <span className="text-accent-green">{cve.fix_version}</span>
               </p>
             )}
           </div>

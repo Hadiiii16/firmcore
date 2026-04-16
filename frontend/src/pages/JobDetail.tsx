@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Shield, ArrowLeft, Clock, Package, ShieldAlert, Bot, Terminal, RefreshCw,
+  CircleStop,
 } from 'lucide-react'
 import { useJobDetail } from '../hooks/useJobDetail'
 import { PipelineStepper } from '../components/PipelineStepper'
@@ -31,7 +32,7 @@ export function JobDetail() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState<Tab>('log')
 
-  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, retryingCve, retryVex, retryVexSingle } =
+  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, cancelling, retryingCve, retryVex, retryVexSingle, cancelVex } =
     useJobDetail(jobId!)
 
   const tabs: TabConfig[] = [
@@ -147,7 +148,17 @@ export function JobDetail() {
           )}
           {/* Retry VEX button when completed (no error) */}
           {!errorMessage && (status === 'completed' || status === 'failed' || status === 'vex_analyzing') && (
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              {status === 'vex_analyzing' && (
+                <button
+                  onClick={() => void cancelVex()}
+                  disabled={cancelling}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-mono bg-red-950/40 text-red-300 border border-red-800/50 hover:bg-red-900/60 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <CircleStop size={12} />
+                  {cancelling ? 'Stopping...' : 'Stop VEX'}
+                </button>
+              )}
               <button
                 onClick={() => void retryVex()}
                 disabled={retrying}
