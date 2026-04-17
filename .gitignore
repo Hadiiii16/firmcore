@@ -2,3 +2,7 @@ sbom_claude_scripts
 storage/**/*.ubi
 storage/
 sbom_claude_scripts
+.venv/
+.python-version
+node_modules/
+.gemini/
