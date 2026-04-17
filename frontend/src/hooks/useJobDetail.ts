@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { cancelVex, createJobStream, getJobResult, retryVex, retryVexSingle } from '../api/client'
-import type { JobResult, JobStatus } from '../types'
+import { cancelVex, createJobStream, getJobResult, resumeVex, retryVex, retryVexSingle } from '../api/client'
+import type { CveResult, JobResult, JobStatus } from '../types'
 
 // 백엔드 SSE 실제 포맷
 // {"type": "stage_start",    "stage": "extracting", "job_id": "..."}
@@ -36,6 +36,7 @@ interface UseJobDetailState {
   errorMessage: string | null
   streaming: boolean
   retrying: boolean
+  resuming: boolean
   cancelling: boolean
   retryingCve: string | null   // 개별 CVE 재분석 중인 CVE ID
 }
@@ -50,6 +51,7 @@ export function useJobDetail(jobId: string) {
     errorMessage: null,
     streaming: true,
     retrying: false,
+    resuming: false,
     cancelling: false,
     retryingCve: null,
   })
@@ -103,6 +105,30 @@ export function useJobDetail(jobId: string) {
       setState((s) => ({
         ...s,
         retrying: false,
+        errorMessage: (err as Error).message,
+      }))
+    }
+  }, [jobId])
+
+  const handleResumeVex = useCallback(async () => {
+    setState((s) => ({ ...s, resuming: true }))
+    try {
+      await resumeVex(jobId)
+      setState((s) => ({
+        ...s,
+        resuming: false,
+        streaming: true,
+        status: 'vex_analyzing' as JobStatus,
+        errorMessage: null,
+        currentStage: 'vex_analyzing',
+        stageProgress: 0,
+        logs: [],
+      }))
+      setReconnectKey((k) => k + 1)
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        resuming: false,
         errorMessage: (err as Error).message,
       }))
     }
@@ -269,15 +295,37 @@ export function useJobDetail(jobId: string) {
           break
         }
 
-        case 'max_turns_reached':
-          addLog('vex_analyzing', `⚠ ${ev.cve_id} 최대 턴 도달 → under_investigation`)
+        case 'vex_json_not_found':
+          addLog('vex_analyzing', `⚠ ${ev.cve_id} OpenVEX JSON 추출 실패 → under_investigation (fallback)`)
           break
 
-        case 'cve_done':
+        case 'cve_done': {
           addLog('vex_analyzing', `✓ ${ev.cve_id} 완료: ${ev.status}`)
-          // CVE 하나 완료될 때마다 VEX 탭 갱신 (incremental 표시)
-          void loadResult()
+          // Merge the single-CVE payload carried on the event instead of
+          // re-fetching /result for every completion.
+          const patch = ev.cve_result as CveResult | undefined
+          if (patch) {
+            setState((s) => {
+              if (!s.result) return s
+              const cves = s.result.cve_results
+              const idx = cves.findIndex((c) => c.cve_id === patch.cve_id)
+              const nextCves = idx >= 0
+                ? cves.map((c, i) => (i === idx ? { ...c, ...patch } : c))
+                : [...cves, patch]
+              const counts = { not_affected_count: 0, affected_count: 0, under_investigation_count: 0 }
+              for (const c of nextCves) {
+                if (c.vex_status === 'not_affected') counts.not_affected_count++
+                else if (c.vex_status === 'affected') counts.affected_count++
+                else if (c.vex_status === 'under_investigation') counts.under_investigation_count++
+              }
+              return {
+                ...s,
+                result: { ...s.result, cve_results: nextCves, ...counts },
+              }
+            })
+          }
           break
+        }
 
         case 'batch_complete':
           addLog('vex_analyzing', `✓ VEX 배치 분석 완료 (${(ev.total as number) ?? 0}개 CVE)`)
@@ -319,6 +367,7 @@ export function useJobDetail(jobId: string) {
   return {
     ...state,
     retryVex: handleRetryVex,
+    resumeVex: handleResumeVex,
     retryVexSingle: handleRetryVexSingle,
     cancelVex: handleCancelVex,
   }

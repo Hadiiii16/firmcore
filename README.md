@@ -213,7 +213,7 @@ firmcore/
 | `executing_command` | Gemini가 생성한 쉘 명령어 실행 |
 | `command_result` | 명령어 실행 결과 (차단 여부 포함) |
 | `vex_complete` | CVE VEX 판정 완료 (status, report_text) |
-| `max_turns_reached` | 최대 턴 도달 → under_investigation |
+| `vex_json_not_found` | Gemini 응답에서 OpenVEX JSON 추출 실패 → under_investigation fallback |
 | `cve_done` | CVE 처리 완료 |
 | `keepalive` | 연결 유지 신호 (10초 주기) |
 

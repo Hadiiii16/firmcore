@@ -32,7 +32,7 @@ export function JobDetail() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState<Tab>('log')
 
-  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, cancelling, retryingCve, retryVex, retryVexSingle, cancelVex } =
+  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, resuming, cancelling, retryingCve, retryVex, resumeVex, retryVexSingle, cancelVex } =
     useJobDetail(jobId!)
 
   const tabs: TabConfig[] = [
@@ -130,19 +130,36 @@ export function JobDetail() {
             stageProgress={stageProgress}
           />
 
-          {/* Error message + Retry VEX button */}
+          {/* Error message + Retry/Resume VEX buttons */}
           {errorMessage && (
             <div className="flex items-start gap-3 bg-red-900/20 border border-red-800/40 rounded-lg px-4 py-2">
               <p className="text-sm text-red-400 font-mono flex-1">✗ {errorMessage}</p>
               {(status === 'failed' || status === 'completed' || status === 'vex_analyzing') && (
-                <button
-                  onClick={() => void retryVex()}
-                  disabled={retrying}
-                  className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-cyan-900/40 text-accent-cyan border border-cyan-700/50 hover:bg-cyan-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shrink-0"
-                >
-                  <RefreshCw size={12} className={retrying ? 'animate-spin' : ''} />
-                  {retrying ? 'Starting…' : 'Retry VEX'}
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  {errorMessage.includes('[RATE_LIMIT]') && (
+                    <button
+                      onClick={() => void resumeVex()}
+                      disabled={resuming}
+                      title="이미 분석된 CVE는 건너뛰고 남은 CVE부터 이어서 분석"
+                      className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-700/50 hover:bg-emerald-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      <RefreshCw size={12} className={resuming ? 'animate-spin' : ''} />
+                      {resuming ? 'Resuming…' : 'Resume VEX'}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      if (window.confirm('기존 VEX 분석 결과를 모두 삭제하고 처음부터 다시 분석합니다. 계속하시겠습니까?')) {
+                        void retryVex()
+                      }
+                    }}
+                    disabled={retrying}
+                    className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-cyan-900/40 text-accent-cyan border border-cyan-700/50 hover:bg-cyan-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <RefreshCw size={12} className={retrying ? 'animate-spin' : ''} />
+                    {retrying ? 'Starting…' : 'Retry VEX'}
+                  </button>
+                </div>
               )}
             </div>
           )}
@@ -160,8 +177,13 @@ export function JobDetail() {
                 </button>
               )}
               <button
-                onClick={() => void retryVex()}
+                onClick={() => {
+                  if (window.confirm('기존 VEX 분석 결과를 모두 삭제하고 처음부터 다시 분석합니다. 계속하시겠습니까?')) {
+                    void retryVex()
+                  }
+                }}
                 disabled={retrying}
+                title="모든 CVE 의 VEX 결과를 삭제하고 다시 분석"
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-mono bg-surface-800 text-gray-400 border border-surface-600 hover:bg-cyan-900/40 hover:text-accent-cyan hover:border-cyan-700/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <RefreshCw size={12} className={retrying ? 'animate-spin' : ''} />

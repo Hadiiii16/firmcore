@@ -31,7 +31,7 @@ from event_bus import broadcast
 from pipeline.extractor import ExtractResult, extract_firmware
 from pipeline.sbom import SbomResult, generate_sbom_multi
 from pipeline.scanner import ScanResult, Vulnerability, scan_sbom
-from pipeline.vex import VexResult, analyze_cve_batch
+from pipeline.vex import VexResult, VexStatement, analyze_cve_batch
 
 logger = logging.getLogger(__name__)
 
@@ -448,8 +448,17 @@ async def _stage_vex(
     cves_to_analyze = cve_override if cve_override is not None else _select_cves_for_vex(scan_result.vulnerabilities)
     total = len(cves_to_analyze)
 
+    # Build a quick lookup for raw vuln data so we can attach a full
+    # CveResult payload to each cve_done event. This lets the frontend
+    # merge one CVE at a time without re-fetching /result.
+    vuln_map: dict[str, Vulnerability] = {
+        v.cve_id: v for v in scan_result.vulnerabilities
+    }
+    pending_stmt: dict[str, VexStatement] = {}
+
     vex_result: Optional[VexResult] = None
     vex_cancelled = False
+    vex_rate_limited: Optional[dict] = None
 
     try:
         async for event in analyze_cve_batch(
@@ -471,8 +480,11 @@ async def _stage_vex(
                 stmt = event.get("statement")
                 status = stmt.status if stmt else event.get("status", "?")
                 logger.info("[VEX] %s → %s", event.get("cve_id", ""), status)
-            elif event_type == "max_turns_reached":
-                logger.warning("[VEX] %s 최대 턴 도달 → under_investigation", event.get("cve_id", ""))
+            elif event_type == "vex_json_not_found":
+                logger.warning(
+                    "[VEX] %s OpenVEX JSON 추출 실패 → under_investigation (fallback)",
+                    event.get("cve_id", ""),
+                )
             elif event_type == "cve_done":
                 logger.info("[VEX] %s 완료: %s", event.get("cve_id", ""), event.get("status", ""))
             elif event_type == "error":
@@ -480,14 +492,46 @@ async def _stage_vex(
             elif event_type == "batch_cancelled":
                 logger.warning("[VEX] 분석 취소: %s", event.get("message", ""))
                 vex_cancelled = True
+            elif event_type == "batch_rate_limited":
+                logger.warning(
+                    "[VEX] Gemini rate-limit — %s (%d/%d) retry_after=%s",
+                    event.get("cve_id", ""), event.get("index", 0),
+                    event.get("total", 0), event.get("retry_after"),
+                )
+                vex_rate_limited = event
 
             # ── emit (직렬화 불가 객체 제거) ─────────────────────────────
             if event_type == "batch_complete":
                 vex_result = event.get("vex_result")
                 emit_event = {k: v for k, v in event.items() if k != "vex_result"}
                 await _emit_event(job_id, emit_event)
-            elif event_type in ("vex_complete",):
+            elif event_type == "vex_complete":
+                stmt_obj = event.get("statement")
+                if isinstance(stmt_obj, VexStatement):
+                    pending_stmt[stmt_obj.cve_id] = stmt_obj
                 emit_event = {k: v for k, v in event.items() if k != "statement"}
+                await _emit_event(job_id, emit_event)
+            elif event_type == "cve_done":
+                cve_id = event.get("cve_id", "")
+                emit_event = dict(event)
+                vuln = vuln_map.get(cve_id)
+                stmt = pending_stmt.pop(cve_id, None)
+                if vuln is not None:
+                    emit_event["cve_result"] = {
+                        "cve_id": vuln.cve_id,
+                        "package_name": vuln.package_name,
+                        "package_version": vuln.package_version,
+                        "severity": vuln.severity,
+                        "description": vuln.description,
+                        "fix_version": vuln.fix_version,
+                        "urls": list(vuln.urls),
+                        "vex_status": stmt.status if stmt else event.get("status"),
+                        "vex_justification": stmt.justification if stmt else None,
+                        "vex_detail": (
+                            (stmt.report_text or stmt.impact_statement)
+                            if stmt else None
+                        ),
+                    }
                 await _emit_event(job_id, emit_event)
             else:
                 await _emit_event(job_id, event)
@@ -507,6 +551,16 @@ async def _stage_vex(
 
     if vex_cancelled:
         await _fail_job(job_id, stage, "VEX 분석이 사용자 요청으로 취소되었습니다.")
+        return
+
+    if vex_rate_limited is not None:
+        retry_after = vex_rate_limited.get("retry_after")
+        hint = f" (재시도까지 약 {retry_after}s)" if retry_after else ""
+        msg = (
+            "[RATE_LIMIT] Gemini 2.5 Pro 쿼터에 도달해 분석을 중단했습니다"
+            f"{hint}. 쿼터 회복 후 'Resume VEX' 로 이어서 분석하세요."
+        )
+        await _fail_job(job_id, stage, msg)
         return
 
     combined_vex_path = storage_dir / "combined_vex.json"

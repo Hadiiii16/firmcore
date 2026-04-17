@@ -19,3 +19,8 @@ httpx>=0.28.1
 # Utilities
 python-ulid==3.0.0
 python-dotenv==1.0.1
+
+# Terminal emulator — renders Gemini CLI (Ink) PTY output to a virtual
+# screen so we emit only the scrolled-out scrollback instead of every
+# redrawn frame.
+pyte==0.8.2
