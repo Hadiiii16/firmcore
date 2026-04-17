@@ -50,6 +50,7 @@ class _GeminiScreen(pyte.HistoryScreen):
         super().select_graphic_rendition(*attrs)
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,22 +88,17 @@ def _get_env(name: str, default: str) -> str:
 
 
 GEMINI_TIMEOUT = int(_get_env("VEX_GEMINI_TIMEOUT", "1800"))  # seconds per Gemini CLI call (30min default)
-# Model pinning: drop "auto"/"default" sentinels so they never reach the CLI.
-# Falling back to the CLI default silently swaps us onto Flash, which then
-# makes "Pro rate-limit → resume" logic unreachable.
-_RAW_GEMINI_MODELS = [
+# Model selection.  "auto"/"default" are sentinels — _gemini_process_args
+# omits the --model flag for them, so the CLI picks its own default and
+# can fall back (e.g. Pro → Flash) on rate-limit without us intervening.
+GEMINI_MODELS = [
     model.strip()
     for model in _get_env(
         "GEMINI_MODELS",
-        _get_env("GEMINI_MODEL", "gemini-2.5-pro"),
+        _get_env("GEMINI_MODEL", "auto"),
     ).split(",")
     if model.strip()
-]
-GEMINI_MODELS = [
-    m for m in _RAW_GEMINI_MODELS if m.lower() not in {"auto", "default"}
-]
-if not GEMINI_MODELS:
-    GEMINI_MODELS = ["gemini-2.5-pro"]
+] or ["auto"]
 GEMINI_MODEL = GEMINI_MODELS[0]
 # Pro 에서 rate-limit 에 걸리면 즉시 중단하고 사용자가 resume 하도록 한다.
 # 내부 자동 재시도는 하지 않으므로 retry cycle 은 1 로 고정(환경변수 무시).
@@ -114,6 +110,14 @@ GEMINI_STREAM_LOG_CHARS = int(_get_env("VEX_GEMINI_STREAM_LOG_CHARS", "800"))
 # and never exits on its own after the final response — we detect completion
 # by idleness instead.
 GEMINI_IDLE_SHUTDOWN_S = int(_get_env("VEX_GEMINI_IDLE_SHUTDOWN", "45"))
+# Number of bottom viewport lines treated as Ink's transient UI zone
+# (spinner / input prompt / footer).  Lines in this zone are *not* emitted
+# incrementally — only lines above it are considered "stable enough" to
+# flush.  Tune via env var if Gemini CLI's UI layout changes.
+VEX_PTY_UI_TAIL_LINES = int(_get_env("VEX_PTY_UI_TAIL_LINES", "4"))
+# Ring-buffer size for the per-CVE emitted-line hash set.  Prevents repeat
+# emission of the same viewport line across chunks while bounding memory.
+VEX_EMIT_HASH_WINDOW = int(_get_env("VEX_EMIT_HASH_WINDOW", "2000"))
 
 # CVE 간 딜레이 (Gemini rate limit 방지)
 CVE_INTER_DELAY = int(os.environ.get("VEX_CVE_DELAY", "5"))  # seconds between CVEs
@@ -186,6 +190,11 @@ def _is_gemini_rate_limit(text: str) -> bool:
         or "no capacity available" in lowered
         or "quota exceeded" in lowered
         or "ratelimitexceeded" in lowered
+        # Gemini CLI (v0.38+) free-tier banner when *all* Pro-class models
+        # have exhausted their per-day quota — the CLI then opens an
+        # interactive `/model` switch menu and hangs waiting for input.
+        or "usage limit reached for all pro models" in lowered
+        or "access resets at" in lowered
     )
 
 
@@ -703,19 +712,17 @@ def _build_gemini_yolo_prompt(
     product_version = product_info.get("version", "unknown")
 
     return (
-        f"@GEMINI.md 의 규칙을 엄격히 적용해서 {cve_id} 분석을 시작해. "
-        f"대상 제품: {product_name} {product_version}. "
-        "중간에 나에게 실행 여부나 결과를 묻지 말고, 네가 직접 내부 쉘(Shell) "
-        "도구를 호출해서 명령어를 실행하고 그 결과 로그를 파싱하는 과정을 "
-        "리포트가 완성될 때까지 무인 에이전트(Autonomous Agent) 모드로 끝까지 진행해.\n\n"
-        "최종 산출물 저장 규칙 (반드시 지킬 것):\n"
-        f"- WriteFile 도구로 OpenVEX JSON 을 작업공간(cwd) 루트의 다음 상대 경로에 저장: {vex_json_rel}\n"
-        f"- WriteFile 도구로 분석 요약 보고서를 작업공간(cwd) 루트의 다음 상대 경로에 저장: {report_md_rel}\n"
-        "- 경로는 cwd(현재 작업 디렉토리) 바로 아래의 파일명이다. 하위 디렉토리를 만들거나 "
-        "`../` 같은 상위 경로를 쓰지 말 것. 작업공간 밖으로 쓰면 WriteFile 이 거부된다.\n"
-        "- 두 파일을 저장한 뒤 Shell 도구로 `ls -l ./" + vex_json_rel + " ./" + report_md_rel + "` "
-        "를 실행해 존재를 확인하고, 그 다음 화면에 요약 보고서만 평문으로 한 번 출력하고 종료할 것. "
-        "OpenVEX JSON 은 화면에 출력하지 말고 파일로만 저장할 것."
+        f"{cve_id} 분석해줘. 대상 제품: {product_name} {product_version}. "
+        f"산출물 저장 경로: ./{vex_json_rel}, ./{report_md_rel}. "
+        f"보고서(./{report_md_rel})는 GEMINI.md '## 최종 출력 형식 → ② "
+        f"<CVE-ID>_report.md' 에 정의된 양식을 **글자 그대로** 따를 것. "
+        f"`=====` 로 시작하는 상하 구분자, ` CVE 분석 요약 보고서` 헤더, "
+        f"`■ CVE ID / ■ 대상 제품 / ■ 취약 컴포넌트 / ■ 분석 일시` 4개 항목, "
+        f"`[발현 조건]`, `[사용한 확인 명령어]`, `[평가 근거]`, `[최종 판정]` "
+        f"4개 섹션 및 `-----` 구분선까지 전부 포함해야 한다. 1단계에서 "
+        f"조기 종료되는 경우에도 모든 섹션을 채우되, 수행하지 않은 단계는 "
+        f"`해당 없음 (N단계에서 판정 완료)` 로 기재한다. 한 줄 요약만 "
+        f"저장하는 것은 금지."
     )
 
 
@@ -784,6 +791,19 @@ async def stream_gemini_yolo(
     pyte_feed = pyte.ByteStream(pyte_screen)
     emitted_history_count = 0
     last_emitted_line: Optional[str] = None
+    # Viewport snapshot from the previous incremental flush.  Used to
+    # detect "stable" rows — rows whose content did not change between
+    # two consecutive scans.  Gemini streams tokens into a single row as
+    # it generates the response, so a row that is still changing is still
+    # being written and must not be emitted yet (otherwise we get partial
+    # fragments like "…zlib 라이브러리의 `inflate." before the full
+    # sentence materialises).
+    prev_viewport: list[str] = []
+    # Hash set of already-emitted non-blank lines.  Used to deduplicate when
+    # the same viewport line is rescanned across chunks and again when it
+    # scrolls into history.  Backed by a deque for FIFO eviction.
+    emitted_hashes: set[str] = set()
+    emitted_order: deque[str] = deque(maxlen=VEX_EMIT_HASH_WINDOW)
     # Chrome lines that sometimes survive into scrollback (workspace path,
     # shortcut hints, etc.).  Filter them when they appear.
     _CHROME_BLOCK = re.compile(
@@ -799,22 +819,106 @@ async def stream_gemini_yolo(
         r"|^\*\s+Type your message",
         re.IGNORECASE,
     )
-
     def _line_to_text(line_dict: Any) -> str:
         if not line_dict:
             return ""
         cols = sorted(line_dict.keys())
         return "".join(line_dict[c].data for c in cols).rstrip()
 
-    async def _emit_line(text: str) -> None:
+    # Box detection helpers.  Ink redraws boxes in-place (rows get overwritten
+    # and ╭/╰ borders scroll into history out-of-order), so we CANNOT rely on
+    # scrollback framing.  Rule: box emission happens only from viewport
+    # scans, and ANY lone box-glyph row in scrollback is dropped.
+    _TRANSIENT_ICONS = ("⊶", "⊷", "⏳")
+    _FINAL_ICONS = ("✓", "✗", "⛔")
+    _BOX_GLYPH_FIRST = set("╭╮╰╯│─━═┄┈")
+
+    def _box_open(line: str) -> bool:
+        return line.lstrip().startswith("╭")
+
+    def _box_close(line: str) -> bool:
+        return line.lstrip().startswith("╰")
+
+    def _is_box_glyph_row(line: str) -> bool:
+        stripped = line.lstrip()
+        return bool(stripped) and stripped[0] in _BOX_GLYPH_FIRST
+
+    def _box_header_key(rows: list[str]) -> Optional[str]:
+        """Return the header text of a ╭…╰ box with leading icon stripped.
+
+        The header is the first inner (│…│) row.  We normalize out the
+        state icon (⊶/⊷/✓/…) so transient and final versions of the same
+        box collapse to the same dedup key.
+        """
+        for row in rows[1:]:
+            s = row.strip()
+            if not s.startswith("│"):
+                continue
+            inner = s.rstrip("│").lstrip("│").strip()
+            for icon in _TRANSIENT_ICONS + _FINAL_ICONS:
+                if inner.startswith(icon):
+                    inner = inner[len(icon):].strip()
+                    break
+            return inner or None
+        return None
+
+    def _box_is_transient(rows: list[str]) -> bool:
+        """True if box header icon is still a queued/streaming indicator."""
+        for row in rows[1:]:
+            s = row.strip()
+            if not s.startswith("│"):
+                continue
+            inner = s.rstrip("│").lstrip("│").strip()
+            return any(inner.startswith(icon) for icon in _TRANSIENT_ICONS)
+        return False
+
+    # Box-level dedup by header key (bypasses per-line hash, which was
+    # broken by identical border rows across boxes).
+    emitted_box_keys: set[str] = set()
+    emitted_box_order: deque[str] = deque(maxlen=256)
+
+    # WriteFile diff suppression.  Gemini CLI prints a numbered diff preview
+    # after WriteFile accepts, which for our OpenVEX JSON flood the log with
+    # content that's already saved to disk.  Enter suppress mode when we see
+    # a WriteFile "Accepted"/"written" header, then skip blank lines and
+    # ``^\s*\d+\s`` diff rows until we see a non-diff non-blank line.
+    _RE_WRITEFILE_HEADER = re.compile(
+        r"WriteFile\s+\S+.*(?:Accepted|written|saved|successfully)",
+        re.IGNORECASE,
+    )
+    _RE_WRITEFILE_DIFF = re.compile(r"^\s*\d+\s")
+    writefile_suppress = [False]  # list for closure mutability
+
+    def _suppress_check(text: str) -> bool:
+        """Return True if ``text`` should be dropped as WriteFile diff body."""
+        stripped = text.strip()
+        if not stripped:
+            return writefile_suppress[0]  # keep skipping blanks while suppressed
+        if writefile_suppress[0]:
+            if _RE_WRITEFILE_DIFF.match(text):
+                return True
+            # Non-diff content after diff — exit suppress mode and emit.
+            writefile_suppress[0] = False
+            return False
+        if _RE_WRITEFILE_HEADER.search(stripped):
+            writefile_suppress[0] = True
+        return False
+
+    async def _emit_raw(text: str) -> None:
+        """Emit a single line without per-line hash dedup.
+
+        Used for box rows — their individual content (borders, ├ separators)
+        is not unique across boxes, so hash dedup would drop rows from later
+        boxes.  Box-level dedup happens in ``_emit_box``.
+        """
         nonlocal last_emitted_line
         stripped = text.strip()
         if stripped and _is_gemini_rate_limit(stripped):
             raise RuntimeError(f"[RATE_LIMIT] {stripped}")
         if stripped and _CHROME_BLOCK.search(text):
             return
-        # Collapse consecutive identical blank lines — one is enough for
-        # block spacing, more is just noise.
+        if _suppress_check(text):
+            return
         if not stripped and last_emitted_line == "":
             return
         display = text
@@ -828,15 +932,121 @@ async def stream_gemini_yolo(
         })
         last_emitted_line = stripped
 
+    async def _emit_line(text: str) -> None:
+        nonlocal last_emitted_line
+        stripped = text.strip()
+        if stripped and _is_gemini_rate_limit(stripped):
+            raise RuntimeError(f"[RATE_LIMIT] {stripped}")
+        if stripped and _CHROME_BLOCK.search(text):
+            return
+        if _suppress_check(text):
+            return
+        # Collapse consecutive identical blank lines — one is enough for
+        # block spacing, more is just noise.
+        if not stripped and last_emitted_line == "":
+            return
+        # Skip lines already emitted from an earlier viewport scan.  Blank
+        # lines bypass the hash (handled by the consecutive-blank collapse
+        # above) so that legitimate blank spacing between blocks survives.
+        if stripped:
+            if text in emitted_hashes:
+                return
+            if len(emitted_order) == emitted_order.maxlen:
+                old = emitted_order[0]
+                emitted_hashes.discard(old)
+            emitted_order.append(text)
+            emitted_hashes.add(text)
+        display = text
+        if len(display) > GEMINI_STREAM_LOG_CHARS + 40:
+            display = display[: GEMINI_STREAM_LOG_CHARS + 40] + "..."
+        label = f"[{cve_id}] {display}" if stripped else f"[{cve_id}]"
+        logger.info("[VEX] %s", label)
+        await progress_q.put({
+            "type": "stage_progress", "stage": "vex_analyzing",
+            "log": label,
+        })
+        last_emitted_line = stripped
+
+    async def _emit_box(rows: list[str]) -> None:
+        """Emit a ╭…╰ box atomically, deduped by header key."""
+        if _box_is_transient(rows):
+            return  # wait for ✓/✗ final state
+        key = _box_header_key(rows)
+        if not key:
+            return
+        if key in emitted_box_keys:
+            return
+        if len(emitted_box_order) == emitted_box_order.maxlen:
+            old = emitted_box_order[0]
+            emitted_box_keys.discard(old)
+        emitted_box_order.append(key)
+        emitted_box_keys.add(key)
+        # WriteFile boxes contain a line-numbered diff of the written file,
+        # which for OpenVEX JSON / report.md is redundant with the on-disk
+        # artifacts.  Keep only the top/bottom borders and the header row.
+        if "WriteFile" in key:
+            if rows:
+                await _emit_raw(rows[0])  # ╭─...─╮
+            for row in rows[1:-1]:
+                s = row.strip()
+                if s.startswith("│") and "WriteFile" in s:
+                    await _emit_raw(row)
+                    break
+            if len(rows) >= 2:
+                await _emit_raw(rows[-1])  # ╰─...─╯
+            return
+        for row in rows:
+            await _emit_raw(row)
+
+    async def _emit_rows(rows: list[str]) -> int:
+        """Emit ``rows`` with box-aware handling.
+
+        - Complete ╭…╰ span → ``_emit_box`` (atomic, header-key deduped,
+          transient states skipped).
+        - Incomplete ╭ (no ╰ yet) → stop, let caller retry next scan.
+        - Bare box-glyph rows (│, ─, ╭ alone, etc.) that are not part of
+          a detected complete span → skipped silently.  In scrollback these
+          are fragments of an in-place-redrawn box; in the viewport they
+          are pre-close box remains.
+        - Anything else → ``_emit_line`` (normal hash-deduped path).
+
+        Returns index up to which rows were consumed.
+        """
+        i = 0
+        n = len(rows)
+        while i < n:
+            row = rows[i]
+            if _box_open(row):
+                j = i + 1
+                while j < n and not _box_close(rows[j]):
+                    if _box_open(rows[j]):
+                        break
+                    j += 1
+                if j < n and _box_close(rows[j]):
+                    await _emit_box(rows[i:j + 1])
+                    i = j + 1
+                    continue
+                # Incomplete box — stop and retry later when ╰ arrives.
+                # In scrollback, pause so the caller doesn't advance past
+                # the ╭ (it won't, so the box can still be completed later).
+                return i
+            if _is_box_glyph_row(row):
+                # Orphan box fragment — skip.  The complete box will be
+                # emitted from a viewport scan.
+                i += 1
+                continue
+            await _emit_line(row)
+            i += 1
+        return n
+
     async def _flush_new_scrollback() -> None:
         nonlocal emitted_history_count
-        top_lines = list(pyte_screen.history.top)
+        top_lines = [_line_to_text(ln) for ln in pyte_screen.history.top]
         if len(top_lines) <= emitted_history_count:
             return
         new_lines = top_lines[emitted_history_count:]
-        emitted_history_count = len(top_lines)
-        for ln in new_lines:
-            await _emit_line(_line_to_text(ln))
+        emitted_count = await _emit_rows(new_lines)
+        emitted_history_count += emitted_count
 
     def _viewport_text() -> str:
         """Dump non-trailing-empty lines from the live viewport."""
@@ -850,8 +1060,46 @@ async def stream_gemini_yolo(
         text = _viewport_text()
         if not text:
             return
-        for row in text.split("\n"):
-            await _emit_line(row)
+        rows = text.split("\n")
+        await _emit_rows(rows)
+
+    async def _flush_viewport_incremental() -> None:
+        """Emit stable viewport lines without waiting for scrollout.
+
+        Stability rule: a row is only emitted if its content is *identical*
+        to what it was on the previous scan.  Gemini streams tokens into
+        a single viewport row, so if the row changed between two scans it
+        is still being written — hold it until the next scan, otherwise we
+        leak partial fragments (e.g. "…zlib 라이브러리의 `inflate." before
+        the full sentence materialises).
+
+        Shell-tool boxes (╭…╰) are emitted atomically *from the viewport*
+        only once the close border is visible AND the header has reached
+        its final ✓/✗/⛔ state (transient ⊶/⊷ versions are skipped).  This
+        handles Ink's in-place box growth — by the time we scan, the box
+        has converged to its final form, and box-level header dedup stops
+        re-emission.  Non-box lines flush through the normal hash-dedup
+        path; bare │ fragments (growing-box leftovers) are dropped.
+        """
+        nonlocal prev_viewport
+        rows = [_line_to_text(pyte_screen.buffer[r]) for r in range(pyte_screen.lines)]
+        last_nonempty = len(rows) - 1
+        while last_nonempty >= 0 and not rows[last_nonempty].strip():
+            last_nonempty -= 1
+        if last_nonempty < 0:
+            prev_viewport = list(rows)
+            return
+        tail_end = max(0, last_nonempty - VEX_PTY_UI_TAIL_LINES + 1)
+        # Find first unstable row within the candidate emit range.  We
+        # only trust rows that match the previous scan verbatim.
+        stable_end = tail_end
+        for i in range(tail_end):
+            if i >= len(prev_viewport) or prev_viewport[i] != rows[i]:
+                stable_end = i
+                break
+        if stable_end > 0:
+            await _emit_rows(rows[:stable_end])
+        prev_viewport = list(rows)
 
     # ── PTY reader task ───────────────────────────────────────────────────
 
@@ -859,6 +1107,13 @@ async def stream_gemini_yolo(
         nonlocal final_detected
         last_chunk_ts = time.monotonic()
         got_any_output = False
+        # When both staging files first appear on disk we start a short
+        # grace window — Gemini still needs to stream the summary report
+        # text to the screen after WriteFile-ing report.md.  Terminate
+        # when either the grace period expires or PTY goes idle briefly.
+        files_seen_at: Optional[float] = None
+        FILES_GRACE_MAX_S = 20.0   # absolute ceiling after files exist
+        FILES_GRACE_IDLE_S = 3.0   # idle threshold once files exist
         try:
             while True:
                 try:
@@ -866,24 +1121,39 @@ async def stream_gemini_yolo(
                 except asyncio.TimeoutError:
                     # Flush any new scrollback that accumulated since last chunk.
                     await _flush_new_scrollback()
+                    # Also release stable viewport lines so users see output
+                    # without waiting for scrollout.
+                    await _flush_viewport_incremental()
                     # Gemini's Ink UI holds stdin open (via our `<&0` wrapper)
                     # and never exits cleanly.  If we've seen output and the
                     # PTY has been silent for GEMINI_IDLE_SHUTDOWN_S, force
                     # termination — response is already in `accumulated`.
                     idle = time.monotonic() - last_chunk_ts
-                    if got_any_output and idle >= GEMINI_IDLE_SHUTDOWN_S:
+                    # Short-circuit idle shutdown if both artifacts exist on
+                    # disk — any brief silence after that means the summary
+                    # stream finished.  Otherwise fall back to the normal
+                    # GEMINI_IDLE_SHUTDOWN_S threshold.
+                    threshold = GEMINI_IDLE_SHUTDOWN_S
+                    if files_seen_at is not None:
+                        threshold = FILES_GRACE_IDLE_S
+                    if got_any_output and idle >= threshold:
+                        reason = (
+                            "idle shutdown after summary stream"
+                            if files_seen_at is not None
+                            else "idle shutdown"
+                        )
                         logger.info(
-                            "[VEX] %s PTY idle %.0fs after output; terminating gemini",
+                            "[VEX] %s PTY idle %.1fs after output; terminating gemini",
                             cve_id, idle,
                         )
                         final_event.set()
                         await _flush_viewport()
                         await progress_q.put({
                             "type": "stage_progress", "stage": "vex_analyzing",
-                            "log": f"[{cve_id}] Gemini output idle {int(idle)}s; terminating",
+                            "log": f"[{cve_id}] Gemini output idle {idle:.1f}s; terminating",
                         })
                         asyncio.create_task(
-                            _terminate_process_group(proc, cve_id, "idle shutdown")
+                            _terminate_process_group(proc, cve_id, reason)
                         )
                         return
                     continue
@@ -909,25 +1179,45 @@ async def stream_gemini_yolo(
                 # the JSON.  Keep chunks raw; strip the joined text below.
                 accumulated.append(chunk.decode("utf-8", errors="replace"))
 
-                # Emit any lines that scrolled into history this chunk.
+                # Emit any lines that scrolled into history this chunk,
+                # plus stable viewport content (above the transient UI zone).
                 await _flush_new_scrollback()
+                await _flush_viewport_incremental()
 
-                # OpenVEX detection on accumulated text (strip ANSI on the
-                # *joined* buffer so split escapes are removed cleanly).
+                # OpenVEX detection: wait for *both* WriteFile staging files
+                # to land on disk (vex.json + report.md), then a grace
+                # window for Gemini to stream the summary report text to
+                # the screen before we terminate.  Parsing JSON out of
+                # accumulated text alone is unreliable because the Gemini
+                # CLI's WriteFile diff preview prints the JSON the moment
+                # the first WriteFile accepts — killing there would cut off
+                # both the report.md write *and* the screen summary.
                 if not final_detected:
-                    full = _strip_ansi("".join(accumulated))
-                    if extract_json_from_response(full) is not None:
-                        final_detected = True
-                        final_event.set()
-                        await _flush_viewport()
-                        await progress_q.put({
-                            "type": "stage_progress", "stage": "vex_analyzing",
-                            "log": f"[{cve_id}] OpenVEX JSON detected; stopping Gemini",
-                        })
-                        asyncio.create_task(
-                            _terminate_process_group(proc, cve_id, "OpenVEX complete")
-                        )
-                        return
+                    vex_stage = rootfs_path / f".firmcore_{cve_id}_vex.json"
+                    report_stage = rootfs_path / f".firmcore_{cve_id}_report.md"
+                    vex_ok = vex_stage.exists() and vex_stage.stat().st_size > 0
+                    report_ok = (
+                        report_stage.exists() and report_stage.stat().st_size > 0
+                    )
+                    if vex_ok and report_ok:
+                        if files_seen_at is None:
+                            files_seen_at = time.monotonic()
+                            logger.info(
+                                "[VEX] %s artifacts written; grace window up to %.0fs for summary stream",
+                                cve_id, FILES_GRACE_MAX_S,
+                            )
+                        elif time.monotonic() - files_seen_at >= FILES_GRACE_MAX_S:
+                            final_detected = True
+                            final_event.set()
+                            await _flush_viewport()
+                            await progress_q.put({
+                                "type": "stage_progress", "stage": "vex_analyzing",
+                                "log": f"[{cve_id}] grace window elapsed; stopping Gemini",
+                            })
+                            asyncio.create_task(
+                                _terminate_process_group(proc, cve_id, "OpenVEX complete")
+                            )
+                            return
         finally:
             # One last flush of scrollback on EOF.
             try:

@@ -123,7 +123,41 @@ pyte_feed = pyte.ByteStream(pyte_screen)
 
 **Chrome 필터 (_CHROME_BLOCK)**: pyte 로 걸러지지 못하고 스크롤백에 한 번이라도 흘러들어간 프레임 장식(`▀▀▀`/`▄▄▄`/`───` 분리선, `YOLO Ctrl+Y`, `workspace (/directory)`, `no sandbox gemini-…` 푸터, `*   Type your message…` 입력 프롬프트)은 정규식으로 제거합니다. Shell 박스의 `╭/╰/│` 는 필터에 포함되지 않으므로 안전합니다.
 
+**증분 뷰포트 방출 (`_flush_viewport_incremental`)**: 스크롤아웃만 기다리면 Gemini 가 thinking 으로 들어가 새 박스를 안 그리는 동안 이미 완성된 박스도 뷰포트에 정체되어 로그 방출이 지연됩니다(박스가 그려지다 멈춘 것처럼 보이는 현상의 원인). 해결로 **매 PTY chunk 와 1초 idle 마다 뷰포트 전체를 스캔해 바닥 `VEX_PTY_UI_TAIL_LINES` (기본 4) 줄을 제외한 나머지 라인을 즉시 `_emit_line` 으로 흘립니다.** 중복 방출은 `_emit_line` 내부의 내용 해시 셋(최근 `VEX_EMIT_HASH_WINDOW` 개, 기본 2000) 으로 차단되므로, 해당 라인이 나중에 history 로 스크롤되어도 다시 나오지 않습니다. 바닥 존은 Ink 의 임시 UI(스피너 / `*   Type your message` / `YOLO` 푸터) 가 상주하는 영역이라 증분 방출에서 빠지고, idle shutdown 과 OpenVEX 완료 시 호출되는 `_flush_viewport()` 가 마지막에 한 번만 이 영역까지 포함해 떠올립니다. 빈 라인은 해시하지 않아 박스 간 간격은 유지됩니다(기존 연속 공백 축약 규칙이 과다 방출만 눌러 줌).
+
 Rate-limit 감지, OpenVEX JSON 조기 종료, idle shutdown(45s) 은 그대로 유지됩니다.
+
+#### 모델 선택 + Rate-limit 시 중단/재개 구조
+
+OAuth 무료 Gemini Code Assist 는 Pro / Flash 가 각각 별도 분당·일일 쿼터를 가집니다. 현재 기본값은 **auto 모드**(`GEMINI_MODEL=auto`) 이고, `_gemini_process_args` 는 `auto` / `default` sentinel 인 경우 `--model` 인자 자체를 생략합니다 — CLI 가 자체 default 모델(Pro)을 쓰다가 쿼터에 걸리면 Flash 로 자동 폴백하게 맡기는 구조입니다. 특정 모델을 고정하고 싶으면 `GEMINI_MODEL=gemini-2.5-pro` 처럼 정확한 모델명을 지정하면 됩니다.
+
+`GEMINI_MODEL_RETRY_CYCLES = 1` 은 **하드코딩** 으로 유지됩니다 (`VEX_GEMINI_MODEL_RETRY_CYCLES` 환경변수는 무시). auto 모드에서는 CLI 가 자동으로 Flash 로 내려가 주는 게 정상이지만, 그 폴백마저 쿼터가 남지 않은 경우 CLI 는 "Usage limit reached for all Pro models ... Access resets at HH:MM GMT+9" 배너와 `/model` 스위치 메뉴를 띄우고 interactive 입력을 기다리며 멈춥니다. 이를 `_is_gemini_rate_limit` 가 감지해 **즉시 중단 → 사용자가 Resume VEX 로 재개**하는 흐름입니다.
+
+이벤트 플로우:
+
+```
+stream_gemini_yolo 예외 "[RATE_LIMIT]"
+  → run_vex_analysis_loop: yield {"type": "rate_limited", "cve_id", "retry_after"}  # 대기/재시도 없음
+  → analyze_cve_batch: yield {"type": "batch_rate_limited", ...} 후 return
+  → _stage_vex: _fail_job 호출, error_message 에 "[RATE_LIMIT]" 마커 + retry_after 힌트 삽입
+  → 프론트엔드 JobDetail: errorMessage 에 "[RATE_LIMIT]" 있으면 "Resume VEX" 버튼 노출
+  → POST /api/jobs/{id}/resume-vex → run_vex_resume
+  → 이미 vex/{CVE-ID}_vex.json 이 있는 CVE 는 skip, 남은 CVE 부터 이어서 분석
+```
+
+`[RATE_LIMIT]` 문자열이 `error_message` 에 있는지로 프론트엔드가 Resume 버튼 표시 여부를 판정하므로, 해당 문자열을 바꾸려면 [JobDetail.tsx](frontend/src/pages/JobDetail.tsx) 의 `errorMessage.includes('[RATE_LIMIT]')` 체크도 함께 수정해야 합니다.
+
+#### WriteFile 기반 artifact 저장 (스테이징 파일)
+
+Gemini 의 `WriteFile` 도구는 `cwd` 바깥 경로로의 저장을 차단합니다. 우리는 `cwd=rootfs_path` 로 실행하므로 `storage/<job>/vex/` 에 직접 쓸 수 없습니다. 대신 rootfs 루트에 hidden staging 파일로 저장하도록 프롬프트를 구성하고, 분석 종료 후 `run_vex_analysis_loop` 가 정식 경로로 옮깁니다:
+
+```python
+vex_stage_rel    = f".firmcore_{cve_id}_vex.json"     # cwd-relative, Gemini 가 WriteFile
+report_stage_rel = f".firmcore_{cve_id}_report.md"
+# 분석 종료 후: rootfs_path / stage_rel → output_dir / {CVE-ID}_{vex.json|report.md} 로 이동
+```
+
+PTY 스트림 파싱은 폴백으로만 사용합니다 (WriteFile 결과가 없거나 파싱 실패 시). 정상 플로우는 디스크의 staging 파일에서 바로 읽어 `VexStatement` 를 구성합니다.
 
 #### JSON 추출 (`extract_json_from_response`)
 
@@ -179,13 +213,18 @@ React + Vite + Tailwind. 핵심 훅:
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `MOCK_PIPELINE` | `false` | 전체 파이프라인 더미 데이터로 시뮬레이션 |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini 모델 (쉼표로 여러 개 지정 시 순서대로 폴백) |
+| `GEMINI_MODEL` / `GEMINI_MODELS` | `auto` | Gemini 모델. `auto`/`default` 면 `--model` 인자 자체를 생략 → CLI default(Pro) → 쿼터 소진 시 Flash 자동 폴백. 특정 모델을 고정하려면 `gemini-2.5-pro` 등 실제 모델명 지정 |
 | `VEX_GEMINI_TIMEOUT` | `1800` | CVE 하나당 Gemini CLI 타임아웃 (초, 기본 30분) |
+| `VEX_GEMINI_IDLE_SHUTDOWN` | `45` | PTY 출력이 시작된 뒤 idle 지속 시 강제 종료 임계치 (초) |
+| `VEX_PTY_UI_TAIL_LINES` | `4` | 증분 뷰포트 방출 시 Ink 의 임시 UI 영역으로 간주할 바닥 라인 수. 스피너/입력 프롬프트/푸터가 여기에 해당 |
+| `VEX_EMIT_HASH_WINDOW` | `2000` | 증분 뷰포트 방출의 내용-해시 중복 필터가 유지할 최근 라인 수 |
 | `VEX_CVE_DELAY` | `5` | CVE 간 딜레이 (Gemini rate limit 방지, 초) |
 | `STORAGE_DIR` | `./storage` | 분석 결과 저장 경로 |
 | `SBOM_BIN` | `./sbom_claude_scripts` | SBOM 생성 바이너리 경로 |
 
-`VEX_GEMINI_OUTPUT_FORMAT` 환경변수는 더 이상 사용하지 않습니다. PTY 모드에서는 `--output-format` 플래그를 사용하지 않습니다.
+더 이상 사용하지 않는 환경변수:
+- `VEX_GEMINI_OUTPUT_FORMAT` — PTY 모드에서는 `--output-format` 을 주지 않습니다.
+- `VEX_GEMINI_MODEL_RETRY_CYCLES`, `VEX_GEMINI_RATE_LIMIT_DEFAULT_WAIT`, `VEX_GEMINI_RATE_LIMIT_MAX_WAIT` — rate-limit 을 내부에서 재시도하지 않고 사용자 수동 Resume 구조로 바뀌었으므로 값이 무시됩니다.
 
 ## 사전 요구사항
 
@@ -227,14 +266,20 @@ Error executing tool run_shell_command: Path not in workspace: Attempted path re
 
 펌웨어 심볼릭 링크가 squashfs-root 외부(sibling 디렉토리)를 가리키는 경우 발생합니다. 현재 미해결 사항입니다.
 
-### VEX 재분석
+### VEX 재분석 엔드포인트
 
-- `POST /api/jobs/{id}/retry-vex` — 완료되지 않은 CVE만 재실행 (이미 `_vex.json` 있는 CVE 건너뜀)
-- `POST /api/jobs/{id}/retry-vex/{cve_id}` — 단일 CVE만 재실행
+세 개의 엔드포인트가 역할별로 구분됩니다:
+
+- `POST /api/jobs/{id}/retry-vex` — **처음부터 다시**. `vex/` 디렉토리와 `combined_vex.json` 을 삭제한 뒤 전체 CVE 를 다시 분석합니다 → `run_vex_only`.
+- `POST /api/jobs/{id}/resume-vex` — **이어서 분석**. `vex/{CVE-ID}_vex.json` 이 이미 있는 CVE 는 skip, 남은 CVE 부터 분석합니다 → `run_vex_resume`. 모든 CVE 가 이미 완료된 상태면 `combined_vex.json` 만 재빌드하고 `completed` 처리합니다.
+- `POST /api/jobs/{id}/retry-vex/{cve_id}` — **단일 CVE만**. 이후 `combined_vex.json` 전체 재빌드 → `run_vex_single`.
+- `POST /api/jobs/{id}/cancel-vex` — 진행 중인 배치를 취소하고 활성 Gemini 프로세스 그룹을 SIGKILL.
+
+Resume 는 rate-limit 복구 외에도 **중간에 JSON 추출이 실패한 CVE 를 다시 시도**하는 용도로도 쓸 수 있습니다. 폴백으로 `under_investigation` 이 저장되면 `{CVE-ID}_vex.json` 이 이미 존재하므로 resume 은 skip 하니, 이 경우에는 `retry-vex/{cve_id}` 로 단일 재분석을 쓰세요.
 
 ### JSON 추출 실패 시
 
-Gemini가 응답을 완성하기 전에 프로세스가 종료되면 (LLM 토큰 중간 종료 등) JSON이 불완전해 `extract_json_from_response`가 실패합니다. 이 경우 `under_investigation` 폴백이 적용되며, `{CVE-ID}_gemini_yolo.md`에 원문이 저장되므로 내용 확인 후 retry-vex로 재실행할 수 있습니다.
+Gemini가 응답을 완성하기 전에 프로세스가 종료되면 (LLM 토큰 중간 종료 등) JSON이 불완전해 `extract_json_from_response`가 실패합니다. 이 경우 `under_investigation` 폴백이 적용되며, `{CVE-ID}_gemini_yolo.md`에 원문이 저장되므로 내용 확인 후 `retry-vex/{cve_id}` 로 해당 CVE 만 재실행할 수 있습니다.
 # 지침 (Instructions)
 - 모든 응답, 생각 과정, 중간 계획은 한국어로 작성하십시오.
 - 특히 씽킹(Thinking) 과정과 코드 설명은 반드시 한국어여야 합니다.
