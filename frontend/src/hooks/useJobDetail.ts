@@ -77,6 +77,10 @@ export function useJobDetail(jobId: string) {
       setState((s) => ({
         ...s,
         result: data,
+        // errorMessage 는 SSE 이벤트로 설정되기도 하지만 새로고침·재연결
+        // 시점에는 DB 기준(result.error_message)만이 유일한 truth.
+        // null/undefined 면 유지, 있으면 덮어쓴다.
+        errorMessage: data.error_message ?? s.errorMessage,
         // 완료/실패 상태면 스트리밍 종료, 분석 중이면 유지
         ...(data.status === 'completed' || data.status === 'failed'
           ? { streaming: false }
@@ -253,15 +257,21 @@ export function useJobDetail(jobId: string) {
           break
 
         case 'stage_error':
+        case 'error': {
+          // 백엔드 _fail_job 은 ``{"type": "error", "message": ...}`` 로
+          // emit 하지만 구 코드는 ``stage_error + error`` 필드를 기대했다.
+          // 두 케이스를 한 번에 처리하고 message/error 둘 다 읽는다.
+          const msg = (ev.message as string | undefined) ?? error ?? '알 수 없는 오류'
           setState((s) => ({
             ...s,
             status: 'failed',
-            errorMessage: error ?? '알 수 없는 오류',
+            errorMessage: msg,
             streaming: false,
           }))
-          addLog('error', `✗ ${error ?? '알 수 없는 오류'}`)
+          addLog('error', `✗ ${msg}`)
           es.close()
           break
+        }
 
         case 'job_complete':
           {

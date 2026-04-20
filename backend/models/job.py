@@ -93,10 +93,16 @@ class CveResult(BaseModel):
     epss_percentile: Optional[float] = None    # 0.0 ~ 1.0 (전체 CVE 대비 분포)
     risk_score: Optional[float] = None         # grype 가 합성한 통합 리스크
     cwes: list[str] = Field(default_factory=list)  # ["CWE-119", ...]
-    # VEX 판정 (not_affected | affected | under_investigation | unknown)
+    # VEX 판정 (not_affected | affected | fixed | under_investigation | unknown)
     vex_status: str = "unknown"
     vex_justification: Optional[str] = None
     vex_detail: Optional[str] = None
+    # 커스텀 확장: status == "affected" 인 경우의 실전 exploitability 티어.
+    #   "low"       — 컴파일 완화(PIE+NX+Canary 등) 가 CVE 공격 유형을 실질
+    #                  차단하여 패치 우선순위를 낮출 수 있음
+    #   "standard"  — 일반 affected (시급 패치 대상)
+    #   None        — status != "affected" (tier 의미 없음)
+    exploitability_tier: Optional[str] = None
 
 
 class SbomComponent(BaseModel):

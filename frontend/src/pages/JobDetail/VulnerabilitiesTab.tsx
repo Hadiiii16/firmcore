@@ -72,7 +72,7 @@ function CveRow({ cve }: { cve: CveResult }) {
           {fmtNum(cve.risk_score, 1)}
         </td>
         <td className="px-3 py-3">
-          <VexBadge status={cve.vex_status} />
+          <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
         </td>
         <td className="px-3 py-3 text-gray-600">
           {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}

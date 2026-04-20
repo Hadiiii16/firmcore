@@ -59,6 +59,8 @@ export function SeverityBadge({ severity }: { severity: Severity }) {
 
 const VEX_STYLES: Record<string, string> = {
   not_affected:        'bg-green-900/60 text-accent-green border border-green-700/40',
+  // affected + low:  orange (not-red, signalling reduced urgency)
+  affected_low:        'bg-orange-900/60 text-orange-300 border border-orange-700/40',
   affected:            'bg-red-900/60 text-red-300 border border-red-700/40',
   fixed:               'bg-blue-900/60 text-blue-300 border border-blue-700/40',
   under_investigation: 'bg-amber-900/60 text-amber-300 border border-amber-700/40',
@@ -66,12 +68,19 @@ const VEX_STYLES: Record<string, string> = {
 
 const VEX_LABELS: Record<string, string> = {
   not_affected:        'NOT AFFECTED',
+  affected_low:        'AFFECTED · LOW',
   affected:            'AFFECTED',
   fixed:               'FIXED',
   under_investigation: 'INVESTIGATING',
 }
 
-export function VexBadge({ status }: { status: string | null }) {
+export function VexBadge({
+  status,
+  tier,
+}: {
+  status: string | null
+  tier?: 'low' | 'standard' | null
+}) {
   if (!status) {
     return (
       <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono text-gray-500 bg-surface-600">
@@ -79,10 +88,20 @@ export function VexBadge({ status }: { status: string | null }) {
       </span>
     )
   }
-  const style = VEX_STYLES[status] ?? 'bg-surface-600 text-gray-400'
-  const label = VEX_LABELS[status] ?? status.toUpperCase()
+  // Affected + low-tier gets its own styling so users immediately see the
+  // reduced urgency without having to open the analysis detail.
+  const key = status === 'affected' && tier === 'low' ? 'affected_low' : status
+  const style = VEX_STYLES[key] ?? 'bg-surface-600 text-gray-400'
+  const label = VEX_LABELS[key] ?? status.toUpperCase()
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-semibold ${style}`}>
+    <span
+      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-semibold ${style}`}
+      title={
+        key === 'affected_low'
+          ? '컴파일 완화로 exploit 난이도가 높아 패치 우선순위를 낮출 수 있음'
+          : undefined
+      }
+    >
       {label}
     </span>
   )

@@ -86,6 +86,12 @@ export interface CveResult {
   vex_status: string | null
   vex_justification: string | null
   vex_detail: string | null
+  // Custom FirmCore tier when vex_status === 'affected':
+  //   'low'      — compile-time mitigations sufficiently cover the CVE's
+  //                 primary attack class; patch priority can be deferred.
+  //   'standard' — default affected (urgent patch).
+  //   null       — tier is only meaningful for affected statuses.
+  exploitability_tier: 'low' | 'standard' | null
 }
 
 // ── Dashboard aggregation ────────────────────────────────────────────────────

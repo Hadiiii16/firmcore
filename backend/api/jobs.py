@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import AsyncGenerator, Optional
@@ -274,6 +275,7 @@ async def get_job_result(job_id: str) -> JobResult:
             vex_status=vex_map.get(v["cve_id"], {}).get("status", "unknown"),
             vex_justification=vex_map.get(v["cve_id"], {}).get("justification"),
             vex_detail=vex_map.get(v["cve_id"], {}).get("vex_detail"),
+            exploitability_tier=vex_map.get(v["cve_id"], {}).get("exploitability_tier"),
         )
         for v in raw_vulns
     ]
@@ -752,6 +754,36 @@ def _load_scan_results(
         return []
 
 
+_VEX_TIER_RE = re.compile(
+    r"\[EXPLOITABILITY_TIER:\s*(LOW|STANDARD|NONE)\]",
+    re.IGNORECASE,
+)
+
+
+def _vex_tier_from_stmt(stmt: dict) -> Optional[str]:
+    """Resolve exploitability tier from an OpenVEX statement dict.
+
+    Order:
+    1. Explicit ``x_firmcore_exploitability_tier`` field (set by newer runs).
+    2. ``[EXPLOITABILITY_TIER: …]`` prefix in ``impact_statement`` (older runs
+       where the field was not persisted but the prompt-mandated tag is).
+    3. ``None`` when status != "affected" (tier is only meaningful for affected).
+    4. ``"standard"`` as default for affected missing any hint.
+    """
+    status = stmt.get("status")
+    if status != "affected":
+        return None
+    raw = stmt.get("x_firmcore_exploitability_tier")
+    if isinstance(raw, str) and raw.lower() in ("low", "standard"):
+        return raw.lower()
+    m = _VEX_TIER_RE.search(stmt.get("impact_statement") or "")
+    if m:
+        val = m.group(1).lower()
+        if val in ("low", "standard"):
+            return val
+    return "standard"
+
+
 def _load_vex(
     storage_dir: Optional[Path],
     vex_path_str: Optional[str],
@@ -779,6 +811,7 @@ def _load_vex(
                         "status": stmt.get("status", "unknown"),
                         "justification": stmt.get("justification"),
                         "vex_detail": stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
+                        "exploitability_tier": _vex_tier_from_stmt(stmt),
                     }
             return vex_doc, vex_map
         except Exception:
@@ -808,6 +841,7 @@ def _load_vex(
                             "status": stmt.get("status", "unknown"),
                             "justification": stmt.get("justification"),
                             "vex_detail": report_text or stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
+                            "exploitability_tier": _vex_tier_from_stmt(stmt),
                         }
                 except Exception:
                     continue

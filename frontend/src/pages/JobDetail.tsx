@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Shield, ArrowLeft, Clock, Package, ShieldAlert, Bot, Terminal, RefreshCw,
-  CircleStop,
+  CircleStop, Hourglass,
 } from 'lucide-react'
 import { useJobDetail } from '../hooks/useJobDetail'
 import { PipelineStepper } from '../components/PipelineStepper'
@@ -131,38 +131,83 @@ export function JobDetail() {
           />
 
           {/* Error message + Retry/Resume VEX buttons */}
-          {errorMessage && (
-            <div className="flex items-start gap-3 bg-red-900/20 border border-red-800/40 rounded-lg px-4 py-2">
-              <p className="text-sm text-red-400 font-mono flex-1">✗ {errorMessage}</p>
-              {(status === 'failed' || status === 'completed' || status === 'vex_analyzing') && (
-                <div className="flex items-center gap-2 shrink-0">
-                  {errorMessage.includes('[RATE_LIMIT]') && (
-                    <button
-                      onClick={() => void resumeVex()}
-                      disabled={resuming}
-                      title="이미 분석된 CVE는 건너뛰고 남은 CVE부터 이어서 분석"
-                      className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-700/50 hover:bg-emerald-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      <RefreshCw size={12} className={resuming ? 'animate-spin' : ''} />
-                      {resuming ? 'Resuming…' : 'Resume VEX'}
-                    </button>
+          {errorMessage && (() => {
+            const isRateLimit = errorMessage.includes('[RATE_LIMIT]')
+            // Strip the [RATE_LIMIT] marker and try to pull the affected
+            // model + reset hint out for a cleaner, more informative display.
+            const cleaned = errorMessage.replace(/\[RATE_LIMIT\]\s*/, '').trim()
+            const modelMatch = cleaned.match(/^(\S+)\s+쿼터/)
+            const resetMatch = cleaned.match(/Access resets at ([^)]+?)\)/i)
+            const canAct = status === 'failed' || status === 'completed' || status === 'vex_analyzing'
+
+            if (isRateLimit) {
+              return (
+                <div className="flex items-start gap-3 bg-amber-900/20 border border-amber-700/50 rounded-lg px-4 py-3">
+                  <Hourglass size={18} className="text-amber-300 shrink-0 mt-0.5" />
+                  <div className="flex-1 space-y-1">
+                    <p className="text-sm font-mono text-amber-200 font-semibold">
+                      Gemini 일일 쿼터 소진으로 분석 일시 중단
+                    </p>
+                    <p className="text-xs font-mono text-amber-300/80">
+                      {modelMatch && <>모델 <span className="text-amber-200">{modelMatch[1]}</span> · </>}
+                      {resetMatch
+                        ? <>쿼터 리셋 시각 <span className="text-amber-200">{resetMatch[1].trim()}</span></>
+                        : '쿼터가 회복되면 Resume VEX 로 이어서 분석하세요.'}
+                    </p>
+                    <p className="text-xs font-mono text-gray-500 pt-1">
+                      이미 완료된 CVE 는 건너뛰고 남은 CVE 만 다시 분석합니다.
+                    </p>
+                  </div>
+                  {canAct && (
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => void resumeVex()}
+                        disabled={resuming}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-700/50 hover:bg-emerald-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <RefreshCw size={12} className={resuming ? 'animate-spin' : ''} />
+                        {resuming ? 'Resuming…' : 'Resume VEX'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (window.confirm('기존 VEX 분석 결과를 모두 삭제하고 처음부터 다시 분석합니다. 계속하시겠습니까?')) {
+                            void retryVex()
+                          }
+                        }}
+                        disabled={retrying}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-mono bg-surface-800 text-gray-400 border border-surface-600 hover:bg-cyan-900/40 hover:text-accent-cyan hover:border-cyan-700/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <RefreshCw size={12} className={retrying ? 'animate-spin' : ''} />
+                        {retrying ? 'Starting…' : 'Retry VEX'}
+                      </button>
+                    </div>
                   )}
-                  <button
-                    onClick={() => {
-                      if (window.confirm('기존 VEX 분석 결과를 모두 삭제하고 처음부터 다시 분석합니다. 계속하시겠습니까?')) {
-                        void retryVex()
-                      }
-                    }}
-                    disabled={retrying}
-                    className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-cyan-900/40 text-accent-cyan border border-cyan-700/50 hover:bg-cyan-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  >
-                    <RefreshCw size={12} className={retrying ? 'animate-spin' : ''} />
-                    {retrying ? 'Starting…' : 'Retry VEX'}
-                  </button>
                 </div>
-              )}
-            </div>
-          )}
+              )
+            }
+
+            return (
+              <div className="flex items-start gap-3 bg-red-900/20 border border-red-800/40 rounded-lg px-4 py-2">
+                <p className="text-sm text-red-400 font-mono flex-1">✗ {cleaned}</p>
+                {canAct && (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => {
+                        if (window.confirm('기존 VEX 분석 결과를 모두 삭제하고 처음부터 다시 분석합니다. 계속하시겠습니까?')) {
+                          void retryVex()
+                        }
+                      }}
+                      disabled={retrying}
+                      className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-cyan-900/40 text-accent-cyan border border-cyan-700/50 hover:bg-cyan-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      <RefreshCw size={12} className={retrying ? 'animate-spin' : ''} />
+                      {retrying ? 'Starting…' : 'Retry VEX'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          })()}
           {/* Retry VEX button when completed (no error) */}
           {!errorMessage && (status === 'completed' || status === 'failed' || status === 'vex_analyzing') && (
             <div className="flex justify-end gap-2">

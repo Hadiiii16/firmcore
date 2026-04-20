@@ -130,6 +130,13 @@ VEX_PTY_UI_TAIL_LINES = int(_get_env("VEX_PTY_UI_TAIL_LINES", "4"))
 # Ring-buffer size for the per-CVE emitted-line hash set.  Prevents repeat
 # emission of the same viewport line across chunks while bounding memory.
 VEX_EMIT_HASH_WINDOW = int(_get_env("VEX_EMIT_HASH_WINDOW", "2000"))
+# Max characters of the CVE description to embed in the Gemini prompt.
+# ``0`` = unlimited (default).  The prompt budget is negligible compared to
+# the cost of Gemini re-fetching the advisory via GoogleSearch when the
+# description gets truncated, so clamp only if you hit a specific API
+# per-request limit.  Empirical distribution on a 1240-CVE scan set:
+# median 158, mean 404, max ~3900 chars — the 96th percentile is 1600.
+VEX_DESC_MAX_CHARS = int(_get_env("VEX_DESC_MAX_CHARS", "0"))
 # PTY viewport width (columns).  Ink renders every box at terminal width,
 # so wider = boxes with more empty padding that wrap in fixed-width log
 # viewers.  140 fits typical browser/code-editor widths without cramping
@@ -383,13 +390,18 @@ async def terminate_active_gemini_processes(reason: str = "cancel requested") ->
 @dataclass
 class VexStatement:
     cve_id: str
-    status: str             # not_affected | affected | under_investigation
+    status: str             # not_affected | affected | fixed | under_investigation
     justification: Optional[str]
     # vulnerable_code_not_present | vulnerable_code_not_in_execute_path |
-    # inline_mitigations_already_exist | None
+    # vulnerable_code_cannot_be_controlled_by_adversary | None
     impact_statement: str
     analysis_turns: int = 0
     report_text: str = ""   # 분석 요약 보고서 (OpenVEX JSON 앞의 텍스트)
+    # ``low``  — compile-time mitigations sufficiently cover the CVE's
+    #             primary attack class (Stack BOF w/ Canary+NX+PIE etc.)
+    # ``standard`` — default for affected
+    # ``None``  — status != affected (not_affected / fixed / under_investigation)
+    exploitability_tier: Optional[str] = None
 
 
 @dataclass
@@ -402,75 +414,11 @@ class VexResult:
 
 
 # ---------------------------------------------------------------------------
-# System prompt loading
+# System prompt
 # ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT_CACHE: Optional[str] = None
-
-
-def _load_system_prompt() -> str:
-    global _SYSTEM_PROMPT_CACHE
-    if _SYSTEM_PROMPT_CACHE is not None:
-        return _SYSTEM_PROMPT_CACHE
-
-    candidates = [
-        Path(os.environ.get("VEX_SYSTEM_PROMPT", "")),
-        Path(__file__).parent / "vex_system_prompt_v3.md",
-        Path(__file__).parent / "vex_system_prompt_v2.md",
-        Path(__file__).parent / "vex_system_prompt.md",
-    ]
-    for path in candidates:
-        if path and path.is_file():
-            _SYSTEM_PROMPT_CACHE = path.read_text(encoding="utf-8")
-            logger.info("VEX 시스템 프롬프트 로드: %s", path)
-            return _SYSTEM_PROMPT_CACHE
-
-    logger.warning(
-        "vex_system_prompt_v3.md 를 찾을 수 없습니다. 내장 기본 프롬프트 사용."
-    )
-    _SYSTEM_PROMPT_CACHE = _DEFAULT_SYSTEM_PROMPT
-    return _SYSTEM_PROMPT_CACHE
-
-
-def _gemini_prompt_file() -> Path:
-    """Prompt file referenced with Gemini CLI's @file syntax."""
-    configured = os.environ.get("VEX_GEMINI_PROMPT_FILE")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return (Path(__file__).parent / "vex_system_prompt_v3.md").resolve()
-
-
-# 시스템 프롬프트 파일이 없을 경우 사용할 최소 내장 프롬프트
-_DEFAULT_SYSTEM_PROMPT = """\
-당신은 임베디드 펌웨어 정적 분석 기반의 VEX(Vulnerability Exploitability eXchange) \
-생성 전문가입니다. CVE 코드와 대상 소프트웨어를 입력받으면, 해당 취약점이 실제 \
-rootfs 환경에서 도달 가능(Reachable)한지를 3단계로 체계적으로 검증하고, \
-최종적으로 OpenVEX 형식의 문서를 생성합니다.
-
-핵심 원칙:
-- "존재 ≠ 취약": 라이브러리에 취약 코드가 있어도, 실행 경로에서 호출되지 않으면 영향 없음
-- 3단계 도달 가능성 분석(Library → Binary → Configuration)을 순서대로 수행
-- 각 단계에서 "없음"이 확인되면 즉시 VEX 판정으로 넘어감
-
-분석 환경 특이사항:
-- 분석 대상은 임베디드 펌웨어 rootfs (MIPS/ARM 아키텍처 등)
-- 호스트에서 정적 분석 (nm, readelf, strings, file 등 사용)
-- 파일 권한이 보존되지 않을 수 있으므로 ELF 매직바이트(\\x7fELF) 기반 탐지 필수
-- -executable, -perm +x 등 권한 기반 탐지 옵션 사용 금지
-
-VEX 상태값:
-- not_affected / vulnerable_code_not_present: 라이브러리에 취약 코드 없음
-- not_affected / vulnerable_code_not_in_execute_path: 코드 있으나 호출 경로 없음
-- not_affected / inline_mitigations_already_exist: 호출 경로 있으나 모든 설정 레이어에서 비활성화
-- affected: 1~3단계 모두 취약 조건 충족
-- under_investigation: 결론이 불분명하여 추가 분석 필요
-
-최종 응답에는 분석 요약 보고서와 OpenVEX JSON을 포함해. OpenVEX JSON은
-반드시 ```json 코드블록 안에 출력하고, @context는
-"https://openvex.dev/ns/v0.2.0" 를 사용해.
-
-한국어로 응답해주세요.
-"""
+# Gemini CLI 가 실행 시점에 ``~/.gemini/GEMINI.md`` 를 자동으로 전역 시스템
+# 프롬프트로 로드하므로, 백엔드에서 별도 프롬프트 파일을 관리하거나 주입하지
+# 않습니다.  (CLAUDE.md "Gemini VEX 분석 시스템 프롬프트" 참고)
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +643,33 @@ def _is_openvex(data: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_EXPLOITABILITY_TIER_RE = re.compile(
+    r"\[EXPLOITABILITY_TIER:\s*(LOW|STANDARD|NONE)\]",
+    re.IGNORECASE,
+)
+
+
+def _extract_tier(status: str, impact_statement: str) -> Optional[str]:
+    """Pull ``exploitability_tier`` out of the ``[EXPLOITABILITY_TIER: …]``
+    prefix that GEMINI.md mandates in ``impact_statement``.
+
+    Rules:
+    - Only ``affected`` carries a meaningful tier (``low`` / ``standard``).
+    - Other statuses return ``None`` regardless of what the prefix says.
+    - Missing / malformed prefix on an ``affected`` statement defaults to
+      ``standard`` so the UI never shows an empty badge.
+    """
+    if status != "affected":
+        return None
+    match = _EXPLOITABILITY_TIER_RE.search(impact_statement or "")
+    if not match:
+        return "standard"
+    value = match.group(1).lower()
+    if value == "none":
+        return "standard"
+    return value  # ``low`` | ``standard``
+
+
 def _extract_statement_from_vex(
     cve_id: str,
     vex_doc: dict,
@@ -704,12 +679,15 @@ def _extract_statement_from_vex(
     stmts = vex_doc.get("statements", [])
     if stmts:
         s = stmts[0]
+        status = s.get("status", "under_investigation")
+        impact = s.get("impact_statement", "")
         return VexStatement(
             cve_id=cve_id,
-            status=s.get("status", "under_investigation"),
+            status=status,
             justification=s.get("justification"),
-            impact_statement=s.get("impact_statement", ""),
+            impact_statement=impact,
             analysis_turns=turns_used,
+            exploitability_tier=_extract_tier(status, impact),
         )
     return VexStatement(
         cve_id=cve_id,
@@ -730,33 +708,78 @@ def _build_gemini_yolo_prompt(
     product_info: dict,
     vex_json_rel: str,
     report_md_rel: str,
+    vuln_info: Optional[dict] = None,
 ) -> str:
     """Build the task prompt sent to Gemini CLI.
 
     System instructions come from GEMINI.md which gemini auto-loads as project
-    context.  This prompt only carries the task-specific parameters plus the
+    context.  This prompt carries the task-specific parameters plus the
     cwd-relative output paths where Gemini must save the final artifacts via
     its WriteFile tool.  Gemini's WriteFile only allows paths inside the
     workspace (cwd = rootfs); the backend moves these staging files to
     ``vex/`` after the run completes.
+
+    When ``vuln_info`` is provided (fields from ``pipeline.scanner.Vulnerability``
+    already collected by grype: description, package_name, package_version,
+    fix_version, urls), we embed it directly so Gemini doesn't need to spend
+    turns / GoogleSearch calls re-fetching CVE metadata that we already have.
     """
     product_name = product_info.get("name", "unknown_product")
     product_version = product_info.get("version", "unknown")
 
+    # ── Pre-resolved CVE context (avoids Gemini re-fetching metadata) ──
+    context_lines: list[str] = []
+    if vuln_info:
+        pkg = vuln_info.get("package_name") or ""
+        pkg_ver = vuln_info.get("package_version") or ""
+        if pkg:
+            context_lines.append(f"- 영향 패키지: {pkg} {pkg_ver}".rstrip())
+        severity = vuln_info.get("severity")
+        if severity:
+            context_lines.append(f"- Severity: {severity}")
+        fix_version = vuln_info.get("fix_version")
+        if fix_version:
+            context_lines.append(f"- 수정 버전: {fix_version}")
+        description = (vuln_info.get("description") or "").strip()
+        if description:
+            # Full advisory text is cheaper than letting Gemini spend a
+            # GoogleSearch turn re-fetching it.  Only clamp when the user
+            # explicitly opts in via VEX_DESC_MAX_CHARS (default 0 = off).
+            if VEX_DESC_MAX_CHARS > 0 and len(description) > VEX_DESC_MAX_CHARS:
+                description = description[:VEX_DESC_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+            context_lines.append(f"- 설명: {description}")
+        urls = vuln_info.get("urls") or []
+        if urls:
+            shown = urls[:3]
+            context_lines.append("- 참고: " + ", ".join(shown))
+
+    context_block = ""
+    if context_lines:
+        context_block = (
+            "이미 스캐너(grype) 가 수집한 CVE 메타데이터이므로 "
+            "**웹 검색(GoogleSearch) 으로 다시 조회하지 말고** 아래 정보를 "
+            "그대로 사용해서 바로 rootfs 도달성 분석으로 넘어갈 것:\n"
+            + "\n".join(context_lines)
+            + "\n\n"
+        )
+
     return (
-        f"{cve_id} 분석해줘. 대상 제품: {product_name} {product_version}. "
-        f"**모든 분석 과정 설명과 최종 보고서는 반드시 한국어로 작성한다** "
-        f"(OpenVEX JSON 의 `impact_statement` 필드만 영문). "
-        f"산출물 저장 경로: ./{vex_json_rel}, ./{report_md_rel}. "
-        f"보고서(./{report_md_rel})는 GEMINI.md '## 최종 출력 형식 → ② "
-        f"<CVE-ID>_report.md' 에 정의된 양식을 **글자 그대로** 따를 것. "
-        f"`=====` 로 시작하는 상하 구분자, ` CVE 분석 요약 보고서` 헤더, "
-        f"`■ CVE ID / ■ 대상 제품 / ■ 취약 컴포넌트 / ■ 분석 일시` 4개 항목, "
-        f"`[발현 조건]`, `[사용한 확인 명령어]`, `[평가 근거]`, `[최종 판정]` "
-        f"4개 섹션 및 `-----` 구분선까지 전부 포함해야 한다. 1단계에서 "
-        f"조기 종료되는 경우에도 모든 섹션을 채우되, 수행하지 않은 단계는 "
-        f"`해당 없음 (N단계에서 판정 완료)` 로 기재한다. 한 줄 요약만 "
-        f"저장하는 것은 금지."
+        f"{cve_id} 분석해줘. 대상 제품: {product_name} {product_version}.\n"
+        + context_block
+        + (
+            f"**모든 분석 과정 설명과 최종 보고서는 반드시 한국어로 작성한다** "
+            f"(OpenVEX JSON 의 `impact_statement` 필드만 영문). "
+            f"산출물 저장 경로: ./{vex_json_rel}, ./{report_md_rel}. "
+            f"보고서(./{report_md_rel})는 GEMINI.md '## 최종 출력 형식 → ② "
+            f"<CVE-ID>_report.md' 에 정의된 양식을 **글자 그대로** 따를 것. "
+            f"`=====` 로 시작하는 상하 구분자, ` CVE 분석 요약 보고서` 헤더, "
+            f"`■ CVE ID / ■ 대상 제품 / ■ 취약 컴포넌트 / ■ 분석 일시` 4개 항목, "
+            f"`[발현 조건]`, `[사용한 확인 명령어]`, `[평가 근거]`, `[최종 판정]` "
+            f"4개 섹션 및 `-----` 구분선까지 전부 포함해야 한다. 1단계에서 "
+            f"조기 종료되는 경우에도 모든 섹션을 채우되, 수행하지 않은 단계는 "
+            f"`해당 없음 (N단계에서 판정 완료)` 로 기재한다. 한 줄 요약만 "
+            f"저장하는 것은 금지."
+        )
     )
 
 
@@ -1249,6 +1272,27 @@ async def stream_gemini_yolo(
         # the dialog text disappears from the viewport.
         dialog_answered = False
         _APPROVAL_DIALOG_RE = re.compile(r"Allow execution of", re.IGNORECASE)
+
+        # Initial prompt auto-submit.  Gemini CLI v0.38.2+ prefills the
+        # positional-argument prompt into the interactive input box and
+        # waits for Enter instead of auto-executing.  We can't use ``-p``
+        # (disables Ink's TTY UI → no Shell boxes), so we detect the
+        # prefilled input and send ``\r\n`` via the PTY.
+        #
+        # The signal we wait on is the ``> {cve_id}`` prefill appearing
+        # in the live viewport — that guarantees Ink finished rendering
+        # AND the Input component is focused.  Sending Enter before the
+        # input is focused (e.g. while the ASCII-art banner is still
+        # drawing) causes the keystroke to be silently dropped, which
+        # then leaves Gemini waiting for input forever.  The absolute
+        # fallback (20s) exists only so we don't hang if future CLI
+        # versions change the prefill format.
+        initial_submitted = False
+        _INITIAL_PROMPT_RE = re.compile(
+            rf"^\s*>\s+{re.escape(cve_id)}",
+            re.MULTILINE,
+        )
+        INITIAL_SUBMIT_FALLBACK_S = 20.0
         try:
             while True:
                 try:
@@ -1337,6 +1381,28 @@ async def stream_gemini_yolo(
                 else:
                     dialog_answered = False
 
+                # Auto-submit the prefilled initial prompt (Gemini v0.38.2+).
+                if not initial_submitted:
+                    elapsed_since_start = time.monotonic() - started_at
+                    prefill_seen = bool(_INITIAL_PROMPT_RE.search(viewport_now))
+                    if prefill_seen or elapsed_since_start >= INITIAL_SUBMIT_FALLBACK_S:
+                        try:
+                            # Send both CR and LF.  Ink's useInput sees
+                            # key.return on either byte depending on
+                            # terminal mode; sending both covers both.
+                            os.write(pty_write_fd, b"\r\n")
+                            initial_submitted = True
+                            logger.info(
+                                "[VEX] %s auto-submitted initial prompt (%s)",
+                                cve_id,
+                                "prefill" if prefill_seen else "fallback timer",
+                            )
+                        except OSError as write_exc:
+                            logger.warning(
+                                "[VEX] %s initial Enter failed: %s",
+                                cve_id, write_exc,
+                            )
+
                 # Keep a raw-decoded copy for OpenVEX JSON detection.
                 # We *cannot* strip ANSI per-chunk here: escape sequences like
                 # ``\x1b[38;2;175;215;215m`` are split across chunk boundaries
@@ -1345,6 +1411,39 @@ async def stream_gemini_yolo(
                 # and emit the rest of the payload as plain text, corrupting
                 # the JSON.  Keep chunks raw; strip the joined text below.
                 accumulated.append(chunk.decode("utf-8", errors="replace"))
+
+                # Rate-limit surveillance on the accumulated buffer.  The
+                # per-line ``_is_gemini_rate_limit`` check inside ``_emit_raw``
+                # only fires if the box containing the banner actually gets
+                # emitted.  Some Gemini versions frame the banner with heavy
+                # box glyphs (``┏━┃┗``) that our box parser doesn't recognise,
+                # leaving the whole banner trapped in the viewport — we'd
+                # then wait 45s for idle shutdown instead of yielding a clean
+                # rate-limited event.  Scan the accumulated ANSI-stripped
+                # text every chunk so we surface the banner regardless of
+                # which frame characters the CLI picks.
+                if not final_detected:
+                    recent_text = _strip_ansi("".join(accumulated[-4:]))
+                    if _is_gemini_rate_limit(recent_text):
+                        # Pull the affected model name and reset-time out of
+                        # the banner so the runner can show an accurate
+                        # "<gemini-3-flash-preview> 쿼터 소진 (21:01 GMT+9 리셋)"
+                        # message instead of a generic one.
+                        m = re.search(
+                            r"usage limit reached for ([A-Za-z0-9._-]+)",
+                            recent_text,
+                            re.IGNORECASE,
+                        )
+                        affected_model = m.group(1).rstrip(".") if m else "Gemini"
+                        reset = re.search(
+                            r"access resets at [^\n.]+",
+                            recent_text,
+                            re.IGNORECASE,
+                        )
+                        reset_hint = f" ({reset.group(0).strip()})" if reset else ""
+                        raise RuntimeError(
+                            f"[RATE_LIMIT] {affected_model} 쿼터 소진{reset_hint}"
+                        )
 
                 # Emit any lines that scrolled into history this chunk,
                 # plus stable viewport content (above the transient UI zone).
@@ -1402,6 +1501,21 @@ async def stream_gemini_yolo(
 
     try:
         while True:
+            # If _read_pty raised (e.g. [RATE_LIMIT] detection) the task is
+            # ``done`` but the gemini process is still running — without
+            # this check we'd loop forever emitting "still running"
+            # heartbeats, never propagating the error and never killing
+            # the stuck gemini.  Re-raise here so the runner can emit the
+            # rate-limited event and the user sees "Resume VEX".
+            if read_task.done():
+                read_exc = read_task.exception()
+                if read_exc is not None:
+                    await _terminate_process_group(
+                        proc, cve_id,
+                        f"read task raised {type(read_exc).__name__}",
+                    )
+                    raise read_exc
+
             if (wait_task.done() or final_event.is_set()) and progress_q.empty() and read_task.done():
                 break
 
@@ -1482,6 +1596,7 @@ async def run_vex_analysis_loop(
     rootfs_path: Path,
     product_info: dict,
     output_dir: Path,
+    vuln_info: Optional[dict] = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Analyze one CVE by delegating shell/tool execution to Gemini CLI itself.
@@ -1521,7 +1636,7 @@ async def run_vex_analysis_loop(
                 pass
 
     prompt = _build_gemini_yolo_prompt(
-        cve_id, product_info, vex_stage_rel, report_stage_rel
+        cve_id, product_info, vex_stage_rel, report_stage_rel, vuln_info
     )
     yield {
         "type": "stage_progress",
@@ -1676,6 +1791,7 @@ async def analyze_cve_batch(
     rootfs_path: Path,
     product_info: dict,
     output_dir: Path,
+    vuln_map: Optional[dict[str, dict]] = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     CVE 목록을 순차 처리하는 배치 분석기.
@@ -1726,6 +1842,7 @@ async def analyze_cve_batch(
             rootfs_path=rootfs_path,
             product_info=product_info,
             output_dir=vex_dir,
+            vuln_info=(vuln_map or {}).get(cve_id),
         ):
             yield event
             if event["type"] == "vex_complete":
@@ -1939,6 +2056,10 @@ def _build_combined_vex(
         # affected 상태에는 justification 미포함 (OpenVEX 스펙)
         if s.justification and s.status not in ("affected", "under_investigation"):
             stmt["justification"] = s.justification
+        # Custom FirmCore extension: affected 상태의 세부 카테고리.  OpenVEX
+        # 표준 외 필드이므로 ``x_firmcore_`` 접두사를 붙인다.
+        if s.exploitability_tier:
+            stmt["x_firmcore_exploitability_tier"] = s.exploitability_tier
         if s.report_text:
             stmt["x_firmcore_report"] = s.report_text
         openvex_stmts.append(stmt)
@@ -1989,13 +2110,19 @@ def rebuild_combined_vex_from_dir(
                                 "rebuild_combined_vex_from_dir: %s 읽기 실패 (%s)",
                                 report_file.name, read_exc,
                             )
+                status = stmt_dict.get("status", "under_investigation")
+                impact = stmt_dict.get("impact_statement", "")
+                tier = stmt_dict.get("x_firmcore_exploitability_tier")
+                if tier is None:
+                    tier = _extract_tier(status, impact)
                 stmt = VexStatement(
                     cve_id=cve_id,
-                    status=stmt_dict.get("status", "under_investigation"),
+                    status=status,
                     justification=stmt_dict.get("justification"),
-                    impact_statement=stmt_dict.get("impact_statement", ""),
+                    impact_statement=impact,
                     analysis_turns=stmt_dict.get("x_firmcore_turns", 0),
                     report_text=report_text,
+                    exploitability_tier=tier,
                 )
                 statements.append(stmt)
         except Exception as exc:

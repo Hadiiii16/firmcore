@@ -12,10 +12,17 @@ interface VexAnalysisTabProps {
   jobStatus: JobStatus | null
 }
 
-const VEX_ORDER = ['affected', 'under_investigation', 'not_affected', 'fixed']
+// Order within the table: urgent first, then deprioritised, then resolved.
+// Affected w/ exploitability_tier === 'low' sorts *after* standard-affected
+// since its patch priority is lower.
+const VEX_ORDER = ['affected', 'affected_low', 'under_investigation', 'not_affected', 'fixed']
 
-function vexOrder(status: string | null) {
-  const idx = VEX_ORDER.indexOf(status ?? '')
+function vexOrder(cve: CveResult) {
+  const key =
+    cve.vex_status === 'affected' && cve.exploitability_tier === 'low'
+      ? 'affected_low'
+      : (cve.vex_status ?? '')
+  const idx = VEX_ORDER.indexOf(key)
   return idx === -1 ? VEX_ORDER.length : idx
 }
 
@@ -41,7 +48,7 @@ export function VexAnalysisTab({
 
   const withVex = cves
     .filter((c) => c.vex_status && c.vex_status !== 'unknown')
-    .sort((a, b) => vexOrder(a.vex_status) - vexOrder(b.vex_status))
+    .sort((a, b) => vexOrder(a) - vexOrder(b))
 
   const noVex = cves.filter((c) => !c.vex_status || c.vex_status === 'unknown')
 
@@ -137,7 +144,7 @@ export function VexAnalysisTab({
                   {cve.package_name} {cve.package_version}
                 </span>
                 <div className="ml-auto flex items-center gap-2 shrink-0">
-                  <VexBadge status={cve.vex_status} />
+                  <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
                   <RetryButton cveId={cve.cve_id} />
                   <ResumeFromButton cveId={cve.cve_id} />
                 </div>

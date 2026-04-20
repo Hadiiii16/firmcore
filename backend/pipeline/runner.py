@@ -571,12 +571,27 @@ async def _stage_vex(
     inc_affected = 0
     inc_under_inv = 0
 
+    # grype 가 이미 수집한 CVE 메타데이터를 Gemini 에 그대로 넘겨 중복
+    # 검색(GoogleSearch 등)으로 인한 쿼터 낭비를 줄인다.
+    vuln_info_map: dict[str, dict] = {
+        cve_id: {
+            "package_name": v.package_name,
+            "package_version": v.package_version,
+            "severity": v.severity,
+            "description": v.description,
+            "fix_version": v.fix_version,
+            "urls": list(v.urls),
+        }
+        for cve_id, v in vuln_map.items()
+    }
+
     try:
         async for event in analyze_cve_batch(
             cves=cves_to_analyze,
             rootfs_path=rootfs_path,
             product_info=product_info,
             output_dir=storage_dir,
+            vuln_map=vuln_info_map,
         ):
             event_type = event.get("type", "")
 
@@ -642,6 +657,9 @@ async def _stage_vex(
                             (stmt.report_text or stmt.impact_statement)
                             if stmt else None
                         ),
+                        "exploitability_tier": (
+                            stmt.exploitability_tier if stmt else None
+                        ),
                     }
                 await _emit_event(job_id, emit_event)
             else:
@@ -689,8 +707,14 @@ async def _stage_vex(
     if vex_rate_limited is not None:
         retry_after = vex_rate_limited.get("retry_after")
         hint = f" (재시도까지 약 {retry_after}s)" if retry_after else ""
+        # The affected model name is extracted from the Gemini banner
+        # when available (analyze_cve_batch attaches it); fall back to
+        # a generic label otherwise.  Previously this was hard-coded to
+        # "Gemini 2.5 Pro" which was wrong once auto-mode started
+        # picking gemini-3-* models.
+        model_label = vex_rate_limited.get("model") or "Gemini"
         msg = (
-            "[RATE_LIMIT] Gemini 2.5 Pro 쿼터에 도달해 분석을 중단했습니다"
+            f"[RATE_LIMIT] {model_label} 쿼터에 도달해 분석을 중단했습니다"
             f"{hint}. 쿼터 회복 후 'Resume VEX' 로 이어서 분석하세요."
         )
         await _fail_job(job_id, stage, msg)
