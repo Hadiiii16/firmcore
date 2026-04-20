@@ -420,6 +420,59 @@ async def resume_vex(job_id: str, background_tasks: BackgroundTasks) -> dict:
     return {"job_id": job_id, "status": "vex_analyzing", "mode": "resume"}
 
 
+@router.post("/{job_id}/resume-vex/{cve_id}", status_code=202)
+async def resume_vex_from(
+    job_id: str, cve_id: str, background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    지정된 CVE 부터 VEX 분석을 이어서 실행합니다.
+
+    스캔 정렬 기준으로 ``cve_id`` 와 그 이후 모든 CVE 의 기존 산출물
+    (``vex/{CVE-ID}_*``) 을 삭제한 뒤 그 CVE 부터 다시 분석합니다.
+    이전(상위) CVE 의 결과는 유지됩니다.
+    """
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
+
+    if job["status"] not in ("completed", "failed", "vex_analyzing"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"VEX 이어서 분석은 scanning 이후 상태에서만 가능합니다 (현재: {job['status']})",
+        )
+
+    storage_dir = Path(job["storage_dir"]) if job.get("storage_dir") else None
+    if not storage_dir or not (storage_dir / "scan.json").exists():
+        raise HTTPException(
+            status_code=422,
+            detail="scan.json이 없습니다. 스캔 단계부터 다시 실행해야 합니다.",
+        )
+
+    if not job.get("rootfs_path"):
+        raise HTTPException(
+            status_code=422,
+            detail="rootfs_path가 없습니다. 추출 단계부터 다시 실행해야 합니다.",
+        )
+
+    import os
+    from pipeline.runner import run_vex_resume_from
+    from pipeline.mock import run_mock_pipeline
+
+    MOCK = os.environ.get("MOCK_PIPELINE", "false").lower() == "true"
+    if MOCK:
+        background_tasks.add_task(run_mock_pipeline, job_id)
+    else:
+        background_tasks.add_task(run_vex_resume_from, job_id, cve_id)
+
+    return {
+        "job_id": job_id,
+        "cve_id": cve_id,
+        "status": "vex_analyzing",
+        "mode": "resume_from",
+    }
+
+
 @router.post("/{job_id}/cancel-vex", status_code=202)
 async def cancel_vex(job_id: str) -> dict:
     """

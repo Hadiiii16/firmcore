@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { cancelVex, createJobStream, getJobResult, resumeVex, retryVex, retryVexSingle } from '../api/client'
+import { cancelVex, createJobStream, getJobResult, resumeVex, resumeVexFrom, retryVex, retryVexSingle } from '../api/client'
 import type { CveResult, JobResult, JobStatus } from '../types'
 
 // 백엔드 SSE 실제 포맷
@@ -39,6 +39,7 @@ interface UseJobDetailState {
   resuming: boolean
   cancelling: boolean
   retryingCve: string | null   // 개별 CVE 재분석 중인 CVE ID
+  resumingFromCve: string | null  // 지정된 CVE 부터 이어서 분석 중인 시작 CVE ID
 }
 
 export function useJobDetail(jobId: string) {
@@ -54,6 +55,7 @@ export function useJobDetail(jobId: string) {
     resuming: false,
     cancelling: false,
     retryingCve: null,
+    resumingFromCve: null,
   })
 
   // reconnect trigger: increment to force SSE reconnect
@@ -129,6 +131,30 @@ export function useJobDetail(jobId: string) {
       setState((s) => ({
         ...s,
         resuming: false,
+        errorMessage: (err as Error).message,
+      }))
+    }
+  }, [jobId])
+
+  const handleResumeVexFrom = useCallback(async (cveId: string) => {
+    setState((s) => ({ ...s, resumingFromCve: cveId }))
+    try {
+      await resumeVexFrom(jobId, cveId)
+      setState((s) => ({
+        ...s,
+        resumingFromCve: null,
+        streaming: true,
+        status: 'vex_analyzing' as JobStatus,
+        errorMessage: null,
+        currentStage: 'vex_analyzing',
+        stageProgress: 0,
+        logs: [],
+      }))
+      setReconnectKey((k) => k + 1)
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        resumingFromCve: null,
         errorMessage: (err as Error).message,
       }))
     }
@@ -301,12 +327,19 @@ export function useJobDetail(jobId: string) {
 
         case 'cve_done': {
           addLog('vex_analyzing', `✓ ${ev.cve_id} 완료: ${ev.status}`)
-          // Merge the single-CVE payload carried on the event instead of
-          // re-fetching /result for every completion.
+          // Merge the single-CVE payload carried on the event for fast
+          // partial updates.  If result is still null (page just loaded /
+          // refreshed and the initial fetch hasn't returned yet) the patch
+          // would be lost — fall back to a fresh /result fetch in that
+          // case so the UI eventually catches up.
           const patch = ev.cve_result as CveResult | undefined
+          let needFullLoad = !patch
           if (patch) {
             setState((s) => {
-              if (!s.result) return s
+              if (!s.result) {
+                needFullLoad = true
+                return s
+              }
               const cves = s.result.cve_results
               const idx = cves.findIndex((c) => c.cve_id === patch.cve_id)
               const nextCves = idx >= 0
@@ -324,6 +357,7 @@ export function useJobDetail(jobId: string) {
               }
             })
           }
+          if (needFullLoad) void loadResult()
           break
         }
 
@@ -368,6 +402,7 @@ export function useJobDetail(jobId: string) {
     ...state,
     retryVex: handleRetryVex,
     resumeVex: handleResumeVex,
+    resumeVexFrom: handleResumeVexFrom,
     retryVexSingle: handleRetryVexSingle,
     cancelVex: handleCancelVex,
   }

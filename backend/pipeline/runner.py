@@ -200,6 +200,110 @@ async def run_vex_resume(job_id: str) -> None:
                      cve_override=remaining)
 
 
+async def run_vex_resume_from(job_id: str, start_cve_id: str) -> None:
+    """
+    지정된 CVE 부터 이어서 VEX 분석을 실행합니다.
+
+    스캔 정렬 기준(severity 우선순위 + CVE ID) 으로 ``start_cve_id`` 의
+    인덱스를 찾고, 그 인덱스 이상의 모든 CVE 에 대한 기존 산출물
+    (``vex/{CVE-ID}_*``) 을 삭제한 뒤 분석을 재개합니다.
+    이전(상위) CVE 의 결과는 그대로 보존되며, ``run_vex_resume`` 와 동일하게
+    이미 결과가 있는 CVE 는 자동으로 skip 됩니다 — 단, 이번 호출에서
+    삭제했기 때문에 ``start_cve_id`` 이후는 모두 새로 분석됩니다.
+    """
+    logger.info("[Runner] VEX 지정 CVE부터 이어서 분석: job=%s start=%s",
+                job_id, start_cve_id)
+
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+        if not job:
+            logger.error("[Runner] Job 없음: %s", job_id)
+            return
+
+    storage_dir = Path(job["storage_dir"])
+    rootfs_path_str = job.get("rootfs_path")
+    if not rootfs_path_str:
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message="rootfs_path가 저장되지 않아 VEX 재분석 불가",
+                                completed_at=now_iso())
+        return
+
+    rootfs_path = Path(rootfs_path_str)
+    product_info = {
+        "name": job["product_name"] or "firmware",
+        "version": job["product_version"] or "unknown",
+    }
+
+    scan_json = storage_dir / "scan.json"
+    if not scan_json.exists():
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message="scan.json이 없어 VEX 재분석 불가",
+                                completed_at=now_iso())
+        return
+
+    try:
+        data = json.loads(scan_json.read_text(encoding="utf-8"))
+        vulnerabilities = _parse_scan_vulns(data)
+    except Exception as exc:
+        async with get_db() as db:
+            await db_update_job(db, job_id, status="failed",
+                                error_message=f"scan.json 파싱 실패: {exc}",
+                                completed_at=now_iso())
+        return
+
+    all_cves = _select_cves_for_vex(vulnerabilities)
+    try:
+        start_idx = all_cves.index(start_cve_id)
+    except ValueError:
+        async with get_db() as db:
+            await db_update_job(
+                db, job_id, status="failed",
+                error_message=f"{start_cve_id} 가 스캔 결과에 없습니다.",
+                completed_at=now_iso(),
+            )
+        return
+
+    targets = all_cves[start_idx:]
+
+    # 지정된 CVE 부터의 기존 산출물 삭제 — 그래야 _stage_vex 의
+    # cve_override 가 모두 새로 분석됩니다.
+    vex_dir = storage_dir / "vex"
+    if vex_dir.exists():
+        for cve in targets:
+            for suffix in ("_vex.json", "_report.md", "_gemini_yolo.md", "_pty_raw.log"):
+                p = vex_dir / f"{cve}{suffix}"
+                if p.exists():
+                    p.unlink(missing_ok=True)
+        logger.info("[Runner] %s 이후 %d개 CVE 산출물 삭제",
+                    start_cve_id, len(targets))
+
+    # combined_vex.json 도 부분 재시도이므로 무효화 — 배치 종료 시 재빌드됨.
+    combined = storage_dir / "combined_vex.json"
+    if combined.exists():
+        combined.unlink(missing_ok=True)
+
+    async with get_db() as db:
+        await db_update_job(db, job_id, status="vex_analyzing",
+                            current_stage="vex_analyzing",
+                            stage_progress=0,
+                            error_message=None, completed_at=None)
+
+    from pipeline.scanner import ScanResult
+    filtered_vulns = [v for v in vulnerabilities if v.cve_id in targets]
+    scan_result = ScanResult(
+        vulnerabilities=filtered_vulns,
+        counts_by_severity={},
+        total_count=len(filtered_vulns),
+        log=[],
+        success=True,
+    )
+
+    await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir,
+                     cve_override=targets)
+
+
 async def run_vex_single(job_id: str, cve_id: str) -> None:
     """
     단일 CVE에 대해서만 VEX 분석을 실행합니다.
@@ -459,6 +563,13 @@ async def _stage_vex(
     vex_result: Optional[VexResult] = None
     vex_cancelled = False
     vex_rate_limited: Optional[dict] = None
+    # Incremental VEX status counts.  Updated per cve_done so the dashboard
+    # (5-second polling on /api/jobs) and the detail page (refresh while
+    # analysis is in progress) reflect partial progress instead of staying
+    # at 0/0/0 until the batch finishes.
+    inc_not_affected = 0
+    inc_affected = 0
+    inc_under_inv = 0
 
     try:
         async for event in analyze_cve_batch(
@@ -541,6 +652,28 @@ async def _stage_vex(
                 progress = int((idx - 1) / max(total, 1) * 90)
                 async with get_db() as db:
                     await db_update_job(db, job_id, stage_progress=progress)
+
+            if event_type == "cve_done":
+                status = event.get("status") or ""
+                if status == "not_affected":
+                    inc_not_affected += 1
+                elif status == "affected":
+                    inc_affected += 1
+                elif status == "under_investigation":
+                    inc_under_inv += 1
+                idx = event.get("index", 0)
+                # Push stage_progress + per-status counts to DB so the
+                # dashboard polling sees partial progress without waiting
+                # for batch_complete.
+                progress = int(idx / max(total, 1) * 90)
+                async with get_db() as db:
+                    await db_update_job(
+                        db, job_id,
+                        stage_progress=progress,
+                        not_affected_count=inc_not_affected,
+                        affected_count=inc_affected,
+                        under_investigation_count=inc_under_inv,
+                    )
 
             if vex_cancelled:
                 break

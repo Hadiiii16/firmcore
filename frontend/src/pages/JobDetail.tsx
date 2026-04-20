@@ -32,7 +32,7 @@ export function JobDetail() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState<Tab>('log')
 
-  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, resuming, cancelling, retryingCve, retryVex, resumeVex, retryVexSingle, cancelVex } =
+  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, resuming, cancelling, retryingCve, resumingFromCve, retryVex, resumeVex, resumeVexFrom, retryVexSingle, cancelVex } =
     useJobDetail(jobId!)
 
   const tabs: TabConfig[] = [
@@ -270,7 +270,9 @@ export function JobDetail() {
               <VexAnalysisTab
                 cves={result?.cve_results ?? []}
                 onRetryVexSingle={retryVexSingle}
+                onResumeVexFrom={resumeVexFrom}
                 retryingCve={retryingCve}
+                resumingFromCve={resumingFromCve}
                 jobStatus={status}
               />
             )}

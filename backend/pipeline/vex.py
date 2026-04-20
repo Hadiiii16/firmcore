@@ -134,8 +134,8 @@ VEX_EMIT_HASH_WINDOW = int(_get_env("VEX_EMIT_HASH_WINDOW", "2000"))
 # so wider = boxes with more empty padding that wrap in fixed-width log
 # viewers.  140 fits typical browser/code-editor widths without cramping
 # Shell output (file paths, nm symbols ≈ 60 cols).
-VEX_PTY_COLUMNS = int(_get_env("VEX_PTY_COLUMNS", "80"))
-VEX_PTY_LINES = int(_get_env("VEX_PTY_LINES", "50"))
+VEX_PTY_COLUMNS = int(_get_env("VEX_PTY_COLUMNS", "100"))
+VEX_PTY_LINES = int(_get_env("VEX_PTY_LINES", "80"))
 
 # CVE 간 딜레이 (Gemini rate limit 방지)
 CVE_INTER_DELAY = int(os.environ.get("VEX_CVE_DELAY", "5"))  # seconds between CVEs

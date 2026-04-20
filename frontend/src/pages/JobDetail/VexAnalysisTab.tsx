@@ -1,12 +1,14 @@
-import { useState } from 'react'
-import { RefreshCw, Bot, ChevronDown, ChevronRight } from 'lucide-react'
+import { useState, type MouseEvent } from 'react'
+import { RefreshCw, Bot, ChevronDown, ChevronRight, FastForward } from 'lucide-react'
 import { SeverityBadge, VexBadge } from '../../components/Badge'
 import type { CveResult, JobStatus } from '../../types'
 
 interface VexAnalysisTabProps {
   cves: CveResult[]
   onRetryVexSingle: (cveId: string) => Promise<void>
+  onResumeVexFrom: (cveId: string) => Promise<void>
   retryingCve: string | null
+  resumingFromCve: string | null
   jobStatus: JobStatus | null
 }
 
@@ -17,7 +19,14 @@ function vexOrder(status: string | null) {
   return idx === -1 ? VEX_ORDER.length : idx
 }
 
-export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus }: VexAnalysisTabProps) {
+export function VexAnalysisTab({
+  cves,
+  onRetryVexSingle,
+  onResumeVexFrom,
+  retryingCve,
+  resumingFromCve,
+  jobStatus,
+}: VexAnalysisTabProps) {
   const canRetry = jobStatus === 'completed' || jobStatus === 'failed' || jobStatus === 'vex_analyzing'
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
@@ -46,7 +55,7 @@ export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus 
 
   function RetryButton({ cveId }: { cveId: string }) {
     const isThis = retryingCve === cveId
-    const isBusy = retryingCve !== null
+    const isBusy = retryingCve !== null || resumingFromCve !== null
     return (
       <button
         onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId) }}
@@ -56,6 +65,31 @@ export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus 
       >
         <RefreshCw size={11} className={isThis ? 'animate-spin' : ''} />
         {isThis ? 'Analyzing…' : 'Re-analyze'}
+      </button>
+    )
+  }
+
+  function ResumeFromButton({ cveId }: { cveId: string }) {
+    const isThis = resumingFromCve === cveId
+    const isBusy = retryingCve !== null || resumingFromCve !== null
+    const handleClick = (e: MouseEvent) => {
+      e.stopPropagation()
+      const ok = window.confirm(
+        `${cveId} 부터 이어서 분석합니다.\n` +
+        `${cveId} 와 그 이후 모든 CVE 의 기존 결과는 삭제되고 다시 분석됩니다.\n` +
+        `이전 CVE 의 결과는 그대로 유지됩니다.\n\n계속하시겠습니까?`
+      )
+      if (ok) void onResumeVexFrom(cveId)
+    }
+    return (
+      <button
+        onClick={handleClick}
+        disabled={isBusy || !canRetry}
+        title={canRetry ? `${cveId} 부터 이어서 VEX 분석 (이후 CVE 모두 재분석)` : '분석 완료 후 사용 가능'}
+        className="flex items-center gap-1 px-2 py-1 rounded text-xs font-mono bg-surface-800 text-gray-500 border border-surface-600 hover:bg-emerald-900/40 hover:text-emerald-300 hover:border-emerald-700/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
+      >
+        <FastForward size={11} className={isThis ? 'animate-pulse' : ''} />
+        {isThis ? 'Resuming…' : 'Resume from here'}
       </button>
     )
   }
@@ -105,6 +139,7 @@ export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus 
                 <div className="ml-auto flex items-center gap-2 shrink-0">
                   <VexBadge status={cve.vex_status} />
                   <RetryButton cveId={cve.cve_id} />
+                  <ResumeFromButton cveId={cve.cve_id} />
                 </div>
               </button>
 
@@ -155,6 +190,7 @@ export function VexAnalysisTab({ cves, onRetryVexSingle, retryingCve, jobStatus 
                 <span className="font-mono text-sm text-gray-400">{cve.cve_id}</span>
                 <span className="text-xs text-gray-600 font-mono flex-1">{cve.package_name}</span>
                 <RetryButton cveId={cve.cve_id} />
+                <ResumeFromButton cveId={cve.cve_id} />
               </li>
             ))}
           </ul>

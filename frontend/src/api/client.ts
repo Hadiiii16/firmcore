@@ -95,6 +95,13 @@ export function resumeVex(jobId: string): Promise<{ job_id: string; status: stri
   return request(`/jobs/${jobId}/resume-vex`, { method: 'POST' })
 }
 
+export function resumeVexFrom(
+  jobId: string,
+  cveId: string,
+): Promise<{ job_id: string; cve_id: string; status: string; mode: string }> {
+  return request(`/jobs/${jobId}/resume-vex/${encodeURIComponent(cveId)}`, { method: 'POST' })
+}
+
 export function cancelVex(
   jobId: string,
 ): Promise<{ job_id: string; status: string; terminated_processes: number }> {
