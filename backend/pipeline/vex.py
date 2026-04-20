@@ -33,6 +33,7 @@ import re
 import shutil
 import signal
 import struct
+import termios
 
 import pyte
 
@@ -57,6 +58,17 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 logger = logging.getLogger(__name__)
+
+# Dedicated logger for raw Gemini PTY output — prints lines without the
+# "timestamp [INFO] pipeline.vex —" prefix so the terminal view matches a
+# manual `gemini --yolo` session.  Control-plane events keep using ``logger``.
+stream_logger = logging.getLogger("pipeline.vex.stream")
+if not stream_logger.handlers:
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_logger.addHandler(_stream_handler)
+    stream_logger.propagate = False
+    stream_logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -118,6 +130,12 @@ VEX_PTY_UI_TAIL_LINES = int(_get_env("VEX_PTY_UI_TAIL_LINES", "4"))
 # Ring-buffer size for the per-CVE emitted-line hash set.  Prevents repeat
 # emission of the same viewport line across chunks while bounding memory.
 VEX_EMIT_HASH_WINDOW = int(_get_env("VEX_EMIT_HASH_WINDOW", "2000"))
+# PTY viewport width (columns).  Ink renders every box at terminal width,
+# so wider = boxes with more empty padding that wrap in fixed-width log
+# viewers.  140 fits typical browser/code-editor widths without cramping
+# Shell output (file paths, nm symbols ≈ 60 cols).
+VEX_PTY_COLUMNS = int(_get_env("VEX_PTY_COLUMNS", "80"))
+VEX_PTY_LINES = int(_get_env("VEX_PTY_LINES", "50"))
 
 # CVE 간 딜레이 (Gemini rate limit 방지)
 CVE_INTER_DELAY = int(os.environ.get("VEX_CVE_DELAY", "5"))  # seconds between CVEs
@@ -242,17 +260,25 @@ async def _launch_gemini_pty(
     model: str,
     rootfs_path: Path,
     log_path: Path,
-) -> tuple[asyncio.subprocess.Process, asyncio.StreamReader, asyncio.BaseTransport]:
+) -> tuple[asyncio.subprocess.Process, asyncio.StreamReader, asyncio.BaseTransport, int]:
     """Launch gemini with a real PTY so it behaves like manual execution.
 
-    Returns (proc, reader, transport).  The caller must close transport when done.
-    Raw output is also tee'd to log_path for debugging.
+    Returns (proc, reader, transport, write_fd).  The caller must close
+    transport and ``os.close(write_fd)`` when done.  ``write_fd`` is a
+    duplicate of the PTY master used for pushing input (auto-answering
+    policy-approval menus that Gemini v0.38+ raises for certain tools
+    even under ``--yolo``).  Raw output is also tee'd to log_path for
+    debugging.
     """
     master_fd, slave_fd = pty.openpty()
 
     # Wide terminal so gemini doesn't wrap lines (200 cols)
-    winsize = struct.pack("HHHH", 50, 200, 0, 0)
-    fcntl.ioctl(slave_fd, 0x5414, winsize)  # TIOCSWINSZ
+    # Viewport width tuned via VEX_PTY_COLUMNS (default 140).  Ink draws
+    # boxes at terminal width, so narrower = tighter log lines.  The
+    # YOLO-bypass confirmation dialog's 2-col overflow is handled by
+    # auto-answer in ``_read_pty`` — the dialog disappears quickly.
+    winsize = struct.pack("HHHH", VEX_PTY_LINES, VEX_PTY_COLUMNS, 0, 0)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
     # Without TERM gemini (Ink) falls back to plain-text output and the
     # Shell-tool result boxes (╭│╰) never reach the PTY.
@@ -279,6 +305,12 @@ async def _launch_gemini_pty(
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+    # Duplicate the master fd for writing *before* os.fdopen takes
+    # ownership for the read side.  We never wrap this in an asyncio
+    # transport — it's only used for low-rate, one-shot ``os.write``
+    # calls when we auto-answer an approval menu.
+    write_fd = os.dup(master_fd)
+
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=1 << 20)
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -287,7 +319,7 @@ async def _launch_gemini_pty(
         os.fdopen(master_fd, "rb", buffering=0),
     )
 
-    return proc, reader, transport
+    return proc, reader, transport, write_fd
 
 
 async def _terminate_process_group(
@@ -713,6 +745,8 @@ def _build_gemini_yolo_prompt(
 
     return (
         f"{cve_id} 분석해줘. 대상 제품: {product_name} {product_version}. "
+        f"**모든 분석 과정 설명과 최종 보고서는 반드시 한국어로 작성한다** "
+        f"(OpenVEX JSON 의 `impact_statement` 필드만 영문). "
         f"산출물 저장 경로: ./{vex_json_rel}, ./{report_md_rel}. "
         f"보고서(./{report_md_rel})는 GEMINI.md '## 최종 출력 형식 → ② "
         f"<CVE-ID>_report.md' 에 정의된 양식을 **글자 그대로** 따를 것. "
@@ -760,7 +794,7 @@ async def stream_gemini_yolo(
     pty_log_path = rootfs_path.parent / "vex" / f"{cve_id}_pty_raw.log"
     pty_log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    proc, reader, transport = await _launch_gemini_pty(
+    proc, reader, transport, pty_write_fd = await _launch_gemini_pty(
         gemini_bin, prompt.strip(), model, rootfs_path, pty_log_path
     )
     _ACTIVE_GEMINI_PROCS.add(proc)
@@ -786,11 +820,25 @@ async def stream_gemini_yolo(
     # committed analysis output (Shell boxes, `✦` commentary, final
     # report).  This matches what you see scrolling up in a real terminal.
     pyte_screen = _GeminiScreen(
-        columns=200, lines=50, history=10000, ratio=0.05,
+        columns=VEX_PTY_COLUMNS, lines=VEX_PTY_LINES, history=10000, ratio=0.05,
     )
     pyte_feed = pyte.ByteStream(pyte_screen)
     emitted_history_count = 0
     last_emitted_line: Optional[str] = None
+    # Prefix-merge buffer for streaming LLM token lines (e.g. ``✦ …``).
+    # Ink redraws the same viewport row on every LLM token, and pyte
+    # commits intermediate snapshots to history as the line grows.  To
+    # avoid logging "zlib 1." → "zlib 1.2.11 …" → "zlib 1.2.11 … 탐색
+    # 하겠습니다." as three separate log rows, we hold the last non-box
+    # text line here and only flush it when a non-extending line arrives
+    # (or a box border, or the PTY goes idle).  Extensions (new stripped
+    # text starts with previous stripped text) replace the buffer
+    # silently.  Trailing blank lines (which always follow a ``✦`` row
+    # in pyte's scrollback / viewport) are accumulated as a counter so
+    # they don't prematurely flush the pending line — they'll be
+    # replayed *after* the final text when the buffer eventually flushes.
+    pending_stream_text: Optional[str] = None
+    pending_trailing_blanks: int = 0
     # Viewport snapshot from the previous incremental flush.  Used to
     # detect "stable" rows — rows whose content did not change between
     # two consecutive scans.  Gemini streams tokens into a single row as
@@ -816,6 +864,9 @@ async def stream_gemini_yolo(
         r"|no sandbox\s+gemini-"
         r"|\(Tab to focus\)"
         r"|\(Ctrl\+O to (?:show|hide)\)"
+        r"|Press Ctrl\+O to show more"  # status footer during long output
+        r"|^\s*Auto \(Gemini\s"  # model indicator in footer
+        r"|esc to cancel\)"  # trailing status from thinking state
         r"|^\*\s+Type your message",
         re.IGNORECASE,
     )
@@ -886,7 +937,10 @@ async def stream_gemini_yolo(
         r"WriteFile\s+\S+.*(?:Accepted|written|saved|successfully)",
         re.IGNORECASE,
     )
-    _RE_WRITEFILE_DIFF = re.compile(r"^\s*\d+\s")
+    # Match lines like "     4" (empty content) or "     5 ■ CVE ID: …".
+    # The trailing-whitespace-required form broke on empty diff rows,
+    # which exited suppress mode and leaked the rest of the diff.
+    _RE_WRITEFILE_DIFF = re.compile(r"^\s*\d+(?:\s|$)")
     writefile_suppress = [False]  # list for closure mutability
 
     def _suppress_check(text: str) -> bool:
@@ -895,9 +949,18 @@ async def stream_gemini_yolo(
         if not stripped:
             return writefile_suppress[0]  # keep skipping blanks while suppressed
         if writefile_suppress[0]:
-            if _RE_WRITEFILE_DIFF.match(text):
+            # Keep suppressing while inside the diff body.  Covers three
+            # shapes Gemini's ``Writefile ... Accepted`` preview emits:
+            #   1. numbered rows  "     5 ■ CVE ID: ..."
+            #   2. empty numbered "     4"  (regex with trailing \s failed
+            #      here — hence the \s|$ alternative)
+            #   3. wrapped string continuations with no line number but
+            #      heavy indentation: "           Therefore, ..."
+            # Any of these start with ≥4 leading whitespace characters.
+            # A less-indented / unindented line signals the diff preview
+            # is over (next ✦ message, box border, etc.) — exit suppress.
+            if _RE_WRITEFILE_DIFF.match(text) or text.startswith("    "):
                 return True
-            # Non-diff content after diff — exit suppress mode and emit.
             writefile_suppress[0] = False
             return False
         if _RE_WRITEFILE_HEADER.search(stripped):
@@ -912,6 +975,10 @@ async def stream_gemini_yolo(
         boxes.  Box-level dedup happens in ``_emit_box``.
         """
         nonlocal last_emitted_line
+        # Box borders / staff lines mark the start of a new visual block —
+        # any streaming sentence held in the pending buffer belongs before
+        # the box, so flush now to keep ordering.
+        await _flush_pending_stream()
         stripped = text.strip()
         if stripped and _is_gemini_rate_limit(stripped):
             raise RuntimeError(f"[RATE_LIMIT] {stripped}")
@@ -925,14 +992,19 @@ async def stream_gemini_yolo(
         if len(display) > GEMINI_STREAM_LOG_CHARS + 40:
             display = display[: GEMINI_STREAM_LOG_CHARS + 40] + "..."
         label = f"[{cve_id}] {display}" if stripped else f"[{cve_id}]"
-        logger.info("[VEX] %s", label)
+        stream_logger.info(label)
         await progress_q.put({
             "type": "stage_progress", "stage": "vex_analyzing",
             "log": label,
         })
         last_emitted_line = stripped
 
-    async def _emit_line(text: str) -> None:
+    async def _emit_line_immediate(text: str) -> None:
+        """Direct emit path with chrome/suppress/hash filters.
+
+        Called from ``_emit_line`` (after the pending-stream router
+        decides to release a line) and from ``_flush_pending_stream``.
+        """
         nonlocal last_emitted_line
         stripped = text.strip()
         if stripped and _is_gemini_rate_limit(stripped):
@@ -960,12 +1032,66 @@ async def stream_gemini_yolo(
         if len(display) > GEMINI_STREAM_LOG_CHARS + 40:
             display = display[: GEMINI_STREAM_LOG_CHARS + 40] + "..."
         label = f"[{cve_id}] {display}" if stripped else f"[{cve_id}]"
-        logger.info("[VEX] %s", label)
+        stream_logger.info(label)
         await progress_q.put({
             "type": "stage_progress", "stage": "vex_analyzing",
             "log": label,
         })
         last_emitted_line = stripped
+
+    async def _flush_pending_stream() -> None:
+        """Release any buffered streaming line + its trailing blanks."""
+        nonlocal pending_stream_text, pending_trailing_blanks
+        text = pending_stream_text
+        blanks = pending_trailing_blanks
+        pending_stream_text = None
+        pending_trailing_blanks = 0
+        if text is not None:
+            await _emit_line_immediate(text)
+        for _ in range(blanks):
+            await _emit_line_immediate("")
+
+    async def _emit_line(text: str) -> None:
+        """Route non-box text through a prefix-merge buffer.
+
+        Gemini's LLM-token streaming produces many partial frames of the
+        same ``✦`` sentence, each followed by a blank spacer row.  We
+        hold the latest text here; if a new line extends it (stripped
+        text starts with the buffer's stripped text), we silently
+        replace the buffer.  Blank lines accumulate as a trailing-blank
+        counter — they only emit when the buffer flushes, so they don't
+        force a partial sentence out early.  Non-extending text lines
+        and box rows flush the buffer first, preserving order.
+        """
+        nonlocal pending_stream_text, pending_trailing_blanks
+        stripped = text.strip()
+        if not stripped:
+            if pending_stream_text is None:
+                # No held sentence — emit blank normally (consecutive
+                # blanks are collapsed inside _emit_line_immediate).
+                await _emit_line_immediate(text)
+                return
+            pending_trailing_blanks += 1
+            return
+        # Skip lines that ``_emit_line_immediate`` would itself drop —
+        # already-emitted text (hash hit) and chrome UI (``Press Ctrl+O``,
+        # ``*   Type your message``, etc.).  Critically, if we let them
+        # fall through to the non-extending branch below, they would
+        # displace the pending buffer and leak the held partial before
+        # its extension arrives — the chrome line itself never shows in
+        # the log (filtered in ``_emit_line_immediate``), so the user
+        # sees an inexplicable partial flush with no cause.
+        if text in emitted_hashes or _CHROME_BLOCK.search(text):
+            return
+        if pending_stream_text is not None:
+            pending_stripped = pending_stream_text.strip()
+            if stripped.startswith(pending_stripped):
+                # Replace text; keep any trailing-blank count — the
+                # blanks follow the *final* form of this sentence too.
+                pending_stream_text = text
+                return
+            await _flush_pending_stream()
+        pending_stream_text = text
 
     async def _emit_box(rows: list[str]) -> None:
         """Emit a ╭…╰ box atomically, deduped by header key."""
@@ -1114,6 +1240,15 @@ async def stream_gemini_yolo(
         files_seen_at: Optional[float] = None
         FILES_GRACE_MAX_S = 20.0   # absolute ceiling after files exist
         FILES_GRACE_IDLE_S = 3.0   # idle threshold once files exist
+        # Policy-approval auto-answer state.  Gemini v0.38+ added a new
+        # per-command "Allow execution of [X]?" dialog that fires even
+        # under ``--yolo`` for certain tools (``find -exec``, etc.).
+        # When detected, we write "2\n" to the PTY (= "Allow for this
+        # session") so the analysis doesn't hang until idle timeout.
+        # The flag prevents re-sending on every chunk; it resets when
+        # the dialog text disappears from the viewport.
+        dialog_answered = False
+        _APPROVAL_DIALOG_RE = re.compile(r"Allow execution of", re.IGNORECASE)
         try:
             while True:
                 try:
@@ -1124,6 +1259,13 @@ async def stream_gemini_yolo(
                     # Also release stable viewport lines so users see output
                     # without waiting for scrollout.
                     await _flush_viewport_incremental()
+                    # NOTE: pending-stream buffer is deliberately *not*
+                    # flushed here.  Gemini streams LLM tokens slowly
+                    # enough that 1s gaps are normal mid-sentence — a
+                    # flush would leak partial "✦ 분석 요" fragments.
+                    # The buffer releases on: non-extending text (handled
+                    # in ``_emit_line``), box rows (``_emit_raw``), idle
+                    # shutdown (the block below), and ``finally``.
                     # Gemini's Ink UI holds stdin open (via our `<&0` wrapper)
                     # and never exits cleanly.  If we've seen output and the
                     # PTY has been silent for GEMINI_IDLE_SHUTDOWN_S, force
@@ -1147,6 +1289,7 @@ async def stream_gemini_yolo(
                             cve_id, idle,
                         )
                         final_event.set()
+                        await _flush_pending_stream()
                         await _flush_viewport()
                         await progress_q.put({
                             "type": "stage_progress", "stage": "vex_analyzing",
@@ -1169,6 +1312,30 @@ async def stream_gemini_yolo(
                     pyte_feed.feed(chunk)
                 except Exception as exc:
                     logger.warning("[VEX] %s pyte feed error: %s", cve_id, exc)
+
+                # Auto-answer the YOLO-bypass approval dialog (``Allow
+                # execution of [X]?``) so Gemini doesn't hang on it.
+                # Check the live viewport — the dialog draws inside the
+                # current screen, never scrolls to history.
+                viewport_now = _viewport_text()
+                if _APPROVAL_DIALOG_RE.search(viewport_now):
+                    if not dialog_answered:
+                        try:
+                            # "2\n" selects "Allow for this session" so
+                            # the same tool doesn't re-prompt later.
+                            os.write(pty_write_fd, b"2\n")
+                            dialog_answered = True
+                            logger.info(
+                                "[VEX] %s auto-approved YOLO-bypass dialog",
+                                cve_id,
+                            )
+                        except OSError as write_exc:
+                            logger.warning(
+                                "[VEX] %s approval auto-answer failed: %s",
+                                cve_id, write_exc,
+                            )
+                else:
+                    dialog_answered = False
 
                 # Keep a raw-decoded copy for OpenVEX JSON detection.
                 # We *cannot* strip ANSI per-chunk here: escape sequences like
@@ -1219,9 +1386,14 @@ async def stream_gemini_yolo(
                             )
                             return
         finally:
-            # One last flush of scrollback on EOF.
+            # One last flush of scrollback on EOF, plus any held
+            # streaming sentence still sitting in the pending buffer.
             try:
                 await _flush_new_scrollback()
+            except Exception:
+                pass
+            try:
+                await _flush_pending_stream()
             except Exception:
                 pass
             pty_log_fp.close()
@@ -1262,6 +1434,10 @@ async def stream_gemini_yolo(
         await asyncio.gather(read_task, return_exceptions=True)
 
         transport.close()
+        try:
+            os.close(pty_write_fd)
+        except OSError:
+            pass
 
         # Strip ANSI on the joined buffer (see note in _read_pty): per-chunk
         # stripping misses escapes split across PTY read boundaries.
@@ -1277,12 +1453,20 @@ async def stream_gemini_yolo(
         read_task.cancel()
         wait_task.cancel()
         transport.close()
+        try:
+            os.close(pty_write_fd)
+        except OSError:
+            pass
         raise
     except Exception:
         await _terminate_process_group(proc, cve_id, "error")
         read_task.cancel()
         wait_task.cancel()
         transport.close()
+        try:
+            os.close(pty_write_fd)
+        except OSError:
+            pass
         raise
     finally:
         _ACTIVE_GEMINI_PROCS.discard(proc)
@@ -1789,13 +1973,29 @@ def rebuild_combined_vex_from_dir(
                 cve_id = stmt_dict.get("vulnerability", {}).get("name", "")
                 if not cve_id:
                     continue
+                # 개별 {cve}_vex.json 은 Gemini 가 WriteFile 로 쓴 원본
+                # OpenVEX 라서 x_firmcore_report 확장 필드가 보통 없음.
+                # 보고서 본문은 별도 {cve}_report.md 로 저장되므로 함께
+                # 읽어 report_text 를 채워야 combined_vex 재빌드 결과에
+                # 프론트엔드 ANALYSIS DETAIL 이 보존됨.
+                report_text = stmt_dict.get("x_firmcore_report", "")
+                if not report_text:
+                    report_file = vex_dir / f"{cve_id}_report.md"
+                    if report_file.exists():
+                        try:
+                            report_text = report_file.read_text(encoding="utf-8")
+                        except OSError as read_exc:
+                            logger.warning(
+                                "rebuild_combined_vex_from_dir: %s 읽기 실패 (%s)",
+                                report_file.name, read_exc,
+                            )
                 stmt = VexStatement(
                     cve_id=cve_id,
                     status=stmt_dict.get("status", "under_investigation"),
                     justification=stmt_dict.get("justification"),
                     impact_statement=stmt_dict.get("impact_statement", ""),
                     analysis_turns=stmt_dict.get("x_firmcore_turns", 0),
-                    report_text=stmt_dict.get("x_firmcore_report", ""),
+                    report_text=report_text,
                 )
                 statements.append(stmt)
         except Exception as exc:

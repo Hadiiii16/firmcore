@@ -1,5 +1,7 @@
 from .job import (
     CveResult,
+    DashboardSummary,
+    FirmwareRef,
     JobCreateResponse,
     JobListResponse,
     JobResult,
@@ -7,10 +9,14 @@ from .job import (
     JobSummary,
     SbomComponent,
     StageTiming,
+    TopCve,
+    TopPackage,
 )
 
 __all__ = [
     "CveResult",
+    "DashboardSummary",
+    "FirmwareRef",
     "JobCreateResponse",
     "JobListResponse",
     "JobResult",
@@ -18,4 +24,6 @@ __all__ = [
     "JobSummary",
     "SbomComponent",
     "StageTiming",
+    "TopCve",
+    "TopPackage",
 ]

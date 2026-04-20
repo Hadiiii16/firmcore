@@ -6,3 +6,5 @@ sbom_claude_scripts
 .python-version
 node_modules/
 .gemini/
+__pycache__/
+*.pyc

@@ -244,11 +244,13 @@ async def get_job_result(job_id: str) -> JobResult:
 
     storage_dir = Path(job["storage_dir"]) if job.get("storage_dir") else None
 
-    # ── SBOM 컴포넌트 파싱 ──────────────────────────────────────────────
-    sbom_components = _load_sbom_components(storage_dir, job.get("sbom_path"))
-
-    # ── CVE 스캔 결과 파싱 ──────────────────────────────────────────────
+    # ── CVE 스캔 결과 파싱 (SBOM 크로스 참조를 위해 먼저 로드) ──────────
     raw_vulns = _load_scan_results(storage_dir, job.get("scan_result_path"))
+
+    # ── SBOM 컴포넌트 파싱 (CVE count / max severity 포함) ─────────────
+    sbom_components = _load_sbom_components(
+        storage_dir, job.get("sbom_path"), scan_results=raw_vulns,
+    )
 
     # ── VEX 상태 매핑 ────────────────────────────────────────────────────
     vex_document, vex_map = _load_vex(storage_dir, job.get("combined_vex_path"))
@@ -263,6 +265,12 @@ async def get_job_result(job_id: str) -> JobResult:
             description=v["description"],
             fix_version=v.get("fix_version"),
             urls=v.get("urls", []),
+            cvss_base_score=v.get("cvss_base_score"),
+            cvss_vector=v.get("cvss_vector"),
+            epss_score=v.get("epss_score"),
+            epss_percentile=v.get("epss_percentile"),
+            risk_score=v.get("risk_score"),
+            cwes=v.get("cwes", []),
             vex_status=vex_map.get(v["cve_id"], {}).get("status", "unknown"),
             vex_justification=vex_map.get(v["cve_id"], {}).get("justification"),
             vex_detail=vex_map.get(v["cve_id"], {}).get("vex_detail"),
@@ -505,18 +513,37 @@ async def retry_vex_single(
 
 
 @router.delete("/{job_id}", status_code=204, response_class=Response)
-async def delete_job(job_id: str) -> Response:
-    """Job과 관련 파일을 삭제합니다. 진행 중인 Job은 삭제되지 않습니다."""
+async def delete_job(job_id: str, force: bool = False) -> Response:
+    """Job과 관련 파일을 삭제합니다.
+
+    기본 동작은 ``completed/failed/pending`` 상태만 허용하지만,
+    서버 재시작 등으로 실제로는 죽었는데 DB 상태만 ``vex_analyzing``
+    같은 non-terminal 로 남아 있는 고아 Job 이 생길 수 있습니다.
+    이런 경우 ``?force=true`` 로 강제 삭제가 가능합니다 — active
+    Gemini 프로세스가 있다면 먼저 그 프로세스 그룹을 종료한 뒤 정리.
+    """
     async with get_db() as db:
         job = await db_get_job(db, job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
 
-        if job["status"] not in ("completed", "failed", "pending"):
+        if job["status"] not in ("completed", "failed", "pending") and not force:
             raise HTTPException(
                 status_code=409,
-                detail=f"진행 중인 Job은 삭제할 수 없습니다 (status: {job['status']})",
+                detail=(
+                    f"진행 중인 Job 은 삭제할 수 없습니다 (status: {job['status']}). "
+                    "서버 재시작 등으로 멈춘 경우 ?force=true 로 강제 삭제하세요."
+                ),
             )
+
+        # force 경로: 혹시라도 이 프로세스에 active Gemini 가 남아있다면
+        # 종료한 뒤 DB/파일을 삭제합니다.
+        if force and job["status"] not in ("completed", "failed", "pending"):
+            try:
+                from pipeline.vex import terminate_active_gemini_processes
+                await terminate_active_gemini_processes(f"force-delete {job_id}")
+            except Exception:
+                logger.warning("[Delete] force 종료 중 오류 (계속 진행): %s", job_id)
 
         # DB 레코드 삭제
         await db.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
@@ -539,20 +566,62 @@ async def delete_job(job_id: str) -> Response:
 # ---------------------------------------------------------------------------
 
 
+_SEVERITY_RANK = {
+    "CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0, "": 0,
+}
+
+
 def _load_sbom_components(
     storage_dir: Optional[Path],
     sbom_path_str: Optional[str],
+    scan_results: Optional[list[dict]] = None,
 ) -> list[SbomComponent]:
-    """CycloneDX JSON에서 컴포넌트 목록을 파싱합니다."""
+    """CycloneDX JSON 에서 컴포넌트 목록을 파싱합니다.
+
+    - syft/sbom_claude_scripts 가 같은 패키지를 rootfs 의 여러 복제 경로
+      (예: squashfs-root 와 그 내부 중첩 추출) 에서 찾아 (name, version)
+      쌍이 중복된 컴포넌트 목록을 방출합니다.  여기서 한 번 dedup.
+    - ``scan_results`` 가 주어지면 각 컴포넌트의 CVE 개수와 최고 심각도
+      를 채워 SBOM 탭에서 "어떤 패키지가 위험한가?" 를 한눈에 확인할
+      수 있게 합니다.
+    """
     path = _resolve_path(storage_dir, sbom_path_str, "sbom.cdx.json")
     if not path or not path.exists():
         return []
+
+    # (name, version) → (count, max_rank, max_label)
+    cve_index: dict[tuple[str, str], tuple[int, int, str]] = {}
+    for m in scan_results or []:
+        key = (m.get("package_name", ""), m.get("package_version", ""))
+        sev = (m.get("severity") or "UNKNOWN").upper()
+        rank = _SEVERITY_RANK.get(sev, 0)
+        prev_count, prev_rank, prev_label = cve_index.get(key, (0, -1, ""))
+        cve_index[key] = (
+            prev_count + 1,
+            max(prev_rank, rank),
+            sev if rank > prev_rank else prev_label,
+        )
+
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return [
+    except Exception:
+        logger.warning("SBOM 파싱 실패: %s", path)
+        return []
+
+    seen: set[tuple[str, str]] = set()
+    results: list[SbomComponent] = []
+    for c in data.get("components", []):
+        name = c.get("name", "")
+        version = c.get("version", "")
+        key = (name, version)
+        if key in seen:
+            continue
+        seen.add(key)
+        cve_count, _, max_label = cve_index.get(key, (0, -1, None))
+        results.append(
             SbomComponent(
-                name=c.get("name", ""),
-                version=c.get("version", ""),
+                name=name,
+                version=version,
                 type=c.get("type", ""),
                 purl=c.get("purl"),
                 licenses=[
@@ -560,12 +629,11 @@ def _load_sbom_components(
                     for lic in c.get("licenses", [])
                     if isinstance(lic, dict)
                 ],
+                cve_count=cve_count,
+                max_severity=max_label or None,
             )
-            for c in data.get("components", [])
-        ]
-    except Exception:
-        logger.warning("SBOM 파싱 실패: %s", path)
-        return []
+        )
+    return results
 
 
 def _load_scan_results(
@@ -578,19 +646,52 @@ def _load_scan_results(
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        # syft가 같은 패키지를 rootfs 내 여러 경로(예: squashfs-root 와 그 복사본)
+        # 에서 발견하면 grype 가 동일 (cve, 패키지, 버전) 조합을 각각의 위치마다
+        # 매치로 중복 방출합니다. 프론트엔드 / VEX 분석은 CVE 단위로 동작하므로
+        # 여기서 한 번 dedup 하는 게 가장 간단합니다.
+        seen: set[tuple[str, str, str]] = set()
         results = []
         for match in data.get("matches", []):
             vuln = match.get("vulnerability", {})
             artifact = match.get("artifact", {})
+            key = (
+                vuln.get("id", "UNKNOWN"),
+                artifact.get("name", ""),
+                artifact.get("version", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
             fix_versions = vuln.get("fix", {}).get("versions", [])
+            # CVSS — 여러 벤더 제출본 중 Primary (NVD) 를 우선으로, 없으면
+            # 첫 항목 사용.
+            cvss_list = vuln.get("cvss", []) or []
+            primary_cvss = next(
+                (c for c in cvss_list if c.get("type") == "Primary"),
+                cvss_list[0] if cvss_list else {},
+            )
+            cvss_metrics = (primary_cvss.get("metrics") or {})
+            # EPSS — grype 는 최신 단일 항목만 배열로 넣어둠.
+            epss_list = vuln.get("epss", []) or []
+            epss_entry = epss_list[0] if epss_list else {}
+            # CWE 는 grype 가 "CWE-119" 형태의 문자열 리스트로 방출.
+            cwes_raw = vuln.get("cwes", []) or []
+            cwes = [c for c in cwes_raw if isinstance(c, str)]
             results.append({
-                "cve_id": vuln.get("id", "UNKNOWN"),
-                "package_name": artifact.get("name", ""),
-                "package_version": artifact.get("version", ""),
+                "cve_id": key[0],
+                "package_name": key[1],
+                "package_version": key[2],
                 "severity": vuln.get("severity", "UNKNOWN").upper(),
                 "description": vuln.get("description", ""),
                 "fix_version": fix_versions[0] if fix_versions else None,
                 "urls": vuln.get("urls", []),
+                "cvss_base_score": cvss_metrics.get("baseScore"),
+                "cvss_vector": primary_cvss.get("vector"),
+                "epss_score": epss_entry.get("epss"),
+                "epss_percentile": epss_entry.get("percentile"),
+                "risk_score": vuln.get("risk"),
+                "cwes": cwes,
             })
         return results
     except Exception:

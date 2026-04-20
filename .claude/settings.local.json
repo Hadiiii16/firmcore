@@ -4,7 +4,8 @@
       "Bash(npm run:*)",
       "Bash(python3 -)",
       "Bash(node -)",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('pipeline/vex.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('pipeline/vex.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/pipeline/vex.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

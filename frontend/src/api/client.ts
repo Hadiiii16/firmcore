@@ -1,4 +1,5 @@
 import type {
+  DashboardSummary,
   JobCreateResponse,
   JobListResponse,
   JobResult,
@@ -9,10 +10,20 @@ const BASE = '/api'
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init)
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error((body as { detail?: string }).detail ?? `HTTP ${res.status}`)
+    // 에러 바디가 비어 있거나 JSON 이 아닐 수 있으므로 둘 다 방어.
+    let detail: string | undefined
+    try {
+      const body = await res.json()
+      detail = (body as { detail?: string }).detail
+    } catch { /* swallow */ }
+    throw new Error(detail ?? `HTTP ${res.status}`)
   }
-  return res.json() as Promise<T>
+  // 204 No Content 응답은 바디가 없음 — res.json() 을 호출하면 Safari 가
+  // "The string did not match the expected pattern." 를 throw 하므로 분기.
+  if (res.status === 204) return undefined as unknown as T
+  const text = await res.text()
+  if (!text) return undefined as unknown as T
+  return JSON.parse(text) as T
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
@@ -61,12 +72,19 @@ export function getJobs(limit = 20, offset = 0): Promise<JobListResponse> {
   return request<JobListResponse>(`/jobs?limit=${limit}&offset=${offset}`)
 }
 
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+export function getDashboardSummary(): Promise<DashboardSummary> {
+  return request<DashboardSummary>('/dashboard/summary')
+}
+
 export function getJobResult(jobId: string): Promise<JobResult> {
   return request<JobResult>(`/jobs/${jobId}/result`)
 }
 
-export function deleteJob(jobId: string): Promise<void> {
-  return request<void>(`/jobs/${jobId}`, { method: 'DELETE' })
+export function deleteJob(jobId: string, force = false): Promise<void> {
+  const qs = force ? '?force=true' : ''
+  return request<void>(`/jobs/${jobId}${qs}`, { method: 'DELETE' })
 }
 
 export function retryVex(jobId: string): Promise<{ job_id: string; status: string }> {

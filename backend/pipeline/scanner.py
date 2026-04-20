@@ -306,11 +306,27 @@ def _parse_vulnerabilities(data: dict) -> list[Vulnerability]:
       ]
     }
     """
+    # syft 가 rootfs 내 동일 패키지를 여러 경로(squashfs-root + 그 복제)
+    # 에서 발견하면 grype 가 같은 (cve, package, version) 조합을 중복
+    # 방출합니다.  Dashboard KPI 와 Job 상세 탭은 dedup 해서 보여주는데,
+    # 여기서 dedup 하지 않으면 ``jobs`` 테이블의 critical_cves/high_cves
+    # 등 집계 컬럼만 부풀려져 Job 목록 뱃지와 Dashboard 숫자가 달라집니다.
+    # 여기서 한 번 dedup 해서 소스-오브-트루스로 삼습니다.
+    seen: set[tuple[str, str, str]] = set()
     results: list[Vulnerability] = []
 
     for match in data.get("matches", []):
         vuln = match.get("vulnerability", {})
         artifact = match.get("artifact", {})
+
+        key = (
+            vuln.get("id", "UNKNOWN"),
+            artifact.get("name", ""),
+            artifact.get("version", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
 
         fix_info = vuln.get("fix", {})
         fix_versions = fix_info.get("versions", [])
@@ -318,9 +334,9 @@ def _parse_vulnerabilities(data: dict) -> list[Vulnerability]:
 
         results.append(
             Vulnerability(
-                cve_id=vuln.get("id", "UNKNOWN"),
-                package_name=artifact.get("name", ""),
-                package_version=artifact.get("version", ""),
+                cve_id=key[0],
+                package_name=key[1],
+                package_version=key[2],
                 severity=vuln.get("severity", "UNKNOWN").upper(),
                 description=vuln.get("description", ""),
                 fix_version=fix_version,

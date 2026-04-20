@@ -35,8 +35,8 @@ export function useJobs(limit = 20, refreshInterval = 5000) {
   }, [fetch, refreshInterval])
 
   const remove = useCallback(
-    async (jobId: string) => {
-      await deleteJob(jobId)
+    async (jobId: string, force = false) => {
+      await deleteJob(jobId, force)
       await fetch()
     },
     [fetch],
