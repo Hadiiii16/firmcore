@@ -7,7 +7,9 @@ const STATUS_STYLES: Record<JobStatus, string> = {
   extracting:     'bg-blue-900/60 text-blue-300 animate-pulse',
   sbom_generating:'bg-cyan-900/60 text-cyan-300 animate-pulse',
   scanning:       'bg-purple-900/60 text-purple-300 animate-pulse',
-  vex_analyzing:  'bg-amber-900/60 text-amber-300 animate-pulse',
+  // 진행 중 VEX 는 "LIVE" 뱃지로 강조 — 녹색 + 깜빡이는 점으로 단순
+  // ``VEX AI`` 라벨보다 "실시간 분석 중" 이라는 상태를 명확히 전달.
+  vex_analyzing:  'bg-emerald-900/60 text-emerald-300 border border-emerald-600/50',
   completed:      'bg-green-900/60 text-accent-green',
   failed:         'bg-red-900/60 text-red-400',
 }
@@ -17,16 +19,23 @@ const STATUS_LABELS: Record<JobStatus, string> = {
   extracting:     'EXTRACTING',
   sbom_generating:'SBOM GEN',
   scanning:       'SCANNING',
-  vex_analyzing:  'VEX AI',
+  vex_analyzing:  'LIVE VEX',
   completed:      'DONE',
   failed:         'FAILED',
 }
 
 export function StatusBadge({ status }: { status: JobStatus }) {
+  const isLive = status === 'vex_analyzing'
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-semibold tracking-wider ${STATUS_STYLES[status]}`}
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono font-semibold tracking-wider ${STATUS_STYLES[status]}`}
     >
+      {isLive && (
+        <span className="relative flex h-2 w-2">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
+        </span>
+      )}
       {STATUS_LABELS[status]}
     </span>
   )

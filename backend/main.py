@@ -205,14 +205,18 @@ app = FastAPI(
 # CORS
 # ---------------------------------------------------------------------------
 
+_VITE_FALLBACK_PORTS = [5173, 5174, 5175, 5176, 5177, 5178, 5179]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",   # React (CRA / Vite preview)
-        "http://localhost:5173",   # Vite 개발 서버
+        "http://localhost:3000",
         "http://localhost:8080",   # 자기 자신 (Swagger UI)
         "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
+        # Vite 는 5173 이 이미 사용 중이면 5174~5179 로 자동 폴백하므로
+        # 그 범위를 전부 허용한다.
+        *[f"http://localhost:{p}" for p in _VITE_FALLBACK_PORTS],
+        *[f"http://127.0.0.1:{p}" for p in _VITE_FALLBACK_PORTS],
     ],
     allow_credentials=True,
     allow_methods=["*"],

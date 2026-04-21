@@ -60,6 +60,11 @@ class Vulnerability:
     urls: list[str]
     """참고 URL 목록."""
 
+    cvss_base_score: Optional[float] = None
+    """CVSS v3 baseScore (0.0~10.0).  같은 severity 내 CVE 정렬 타이브레이커로
+    쓰이며 runner 의 ``_select_cves_for_vex`` 순서와 프론트엔드
+    VulnerabilitiesTab / VexAnalysisTab 정렬을 일치시키는 데 필요하다."""
+
 
 @dataclass
 class ScanResult:
@@ -332,6 +337,20 @@ def _parse_vulnerabilities(data: dict) -> list[Vulnerability]:
         fix_versions = fix_info.get("versions", [])
         fix_version: Optional[str] = fix_versions[0] if fix_versions else None
 
+        # CVSS base score — 여러 벤더 제출본 중 Primary (NVD) 우선, 없으면
+        # 첫 항목 사용.  프론트엔드 ``_load_scan_results`` 와 동일 로직.
+        cvss_list = vuln.get("cvss", []) or []
+        primary_cvss = next(
+            (c for c in cvss_list if c.get("type") == "Primary"),
+            cvss_list[0] if cvss_list else {},
+        )
+        cvss_metrics = primary_cvss.get("metrics") or {}
+        cvss_base_score = cvss_metrics.get("baseScore")
+        try:
+            cvss_base_score = float(cvss_base_score) if cvss_base_score is not None else None
+        except (TypeError, ValueError):
+            cvss_base_score = None
+
         results.append(
             Vulnerability(
                 cve_id=key[0],
@@ -341,6 +360,7 @@ def _parse_vulnerabilities(data: dict) -> list[Vulnerability]:
                 description=vuln.get("description", ""),
                 fix_version=fix_version,
                 urls=vuln.get("urls", []),
+                cvss_base_score=cvss_base_score,
             )
         )
 

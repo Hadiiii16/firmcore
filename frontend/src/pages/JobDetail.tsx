@@ -30,18 +30,15 @@ function formatDuration(seconds: number | null): string {
 export function JobDetail() {
   const { jobId } = useParams<{ jobId: string }>()
   const navigate = useNavigate()
-  const [activeTab, setActiveTab] = useState<Tab>('log')
+  // 분석 결과 중심의 탭 순서: SBOM → Vulnerabilities → VEX Analysis.
+  // Pipeline Log 는 개발/디버깅 시에만 관심이 있으므로 마지막에 배치하고,
+  // 페이지 진입 시 기본 탭도 VEX Analysis (= 최종 산출물).
+  const [activeTab, setActiveTab] = useState<Tab>('vex')
 
   const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, resuming, cancelling, retryingCve, resumingFromCve, retryVex, resumeVex, resumeVexFrom, retryVexSingle, cancelVex } =
     useJobDetail(jobId!)
 
   const tabs: TabConfig[] = [
-    {
-      id: 'log',
-      label: 'Pipeline Log',
-      icon: <Terminal size={14} />,
-      count: logs.length,
-    },
     {
       id: 'sbom',
       label: 'SBOM',
@@ -59,6 +56,12 @@ export function JobDetail() {
       label: 'VEX Analysis',
       icon: <Bot size={14} />,
       count: result?.cve_results.filter((c) => c.vex_status).length ?? null,
+    },
+    {
+      id: 'log',
+      label: 'Pipeline Log',
+      icon: <Terminal size={14} />,
+      count: logs.length,
     },
   ]
 
@@ -130,15 +133,20 @@ export function JobDetail() {
             stageProgress={stageProgress}
           />
 
-          {/* Error message + Retry/Resume VEX buttons */}
-          {errorMessage && (() => {
+          {/* Error message + Retry/Resume VEX buttons.  재분석 중
+              (status === 'vex_analyzing') 일 때는 이전 실패/취소 배너가
+              stale 로 남아있을 수 있으므로 강제로 숨긴다 — hooks 단의
+              동기화가 누락되더라도 UI 가 혼란스럽지 않게. */}
+          {errorMessage && status !== 'vex_analyzing' && (() => {
             const isRateLimit = errorMessage.includes('[RATE_LIMIT]')
             // Strip the [RATE_LIMIT] marker and try to pull the affected
             // model + reset hint out for a cleaner, more informative display.
             const cleaned = errorMessage.replace(/\[RATE_LIMIT\]\s*/, '').trim()
             const modelMatch = cleaned.match(/^(\S+)\s+쿼터/)
             const resetMatch = cleaned.match(/Access resets at ([^)]+?)\)/i)
-            const canAct = status === 'failed' || status === 'completed' || status === 'vex_analyzing'
+            // Outer guard already narrowed status to !== 'vex_analyzing',
+            // so only 'failed' / 'completed' remain as actionable states here.
+            const canAct = status === 'failed' || status === 'completed'
 
             if (isRateLimit) {
               return (

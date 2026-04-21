@@ -65,8 +65,21 @@ async def list_jobs(
     async with get_db() as db:
         rows, total = await db_list_jobs(db, limit=limit, offset=offset)
 
-    items = [
-        JobSummary(
+    items = []
+    for r in rows:
+        # jobs 테이블의 affected_count 등은 runner 의 incremental 카운터
+        # 기반이라 Resume/Retry 를 반복하면 stale 해진다.  ``combined_vex
+        # .json`` 또는 ``vex/*_vex.json`` 파일을 살펴 실시간 재집계.
+        aff = r.get("affected_count", 0) or 0
+        na = r.get("not_affected_count", 0) or 0
+        ui = r.get("under_investigation_count", 0) or 0
+        sdir = r.get("storage_dir")
+        if sdir:
+            live = _count_vex_statuses(Path(sdir))
+            if live is not None:
+                aff, na, ui = live
+
+        items.append(JobSummary(
             id=r["id"],
             filename=r["filename"],
             status=JobStatus(r["status"]),
@@ -77,17 +90,58 @@ async def list_jobs(
             total_cves=r.get("total_cves", 0),
             critical_cves=r.get("critical_cves", 0),
             high_cves=r.get("high_cves", 0),
-            affected_count=r.get("affected_count", 0),
-            not_affected_count=r.get("not_affected_count", 0),
-            under_investigation_count=r.get("under_investigation_count", 0),
+            affected_count=aff,
+            not_affected_count=na,
+            under_investigation_count=ui,
             error_message=r.get("error_message"),
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             completed_at=r.get("completed_at"),
-        )
-        for r in rows
-    ]
+        ))
     return JobListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+def _count_vex_statuses(storage_dir: Path) -> Optional[tuple[int, int, int]]:
+    """Return (affected, not_affected, under_investigation) from on-disk VEX.
+
+    Priority: combined_vex.json (배치 완료 후), 없으면 vex/*_vex.json 모음.
+    둘 다 없으면 None → 호출부가 DB 캐시로 폴백하도록 함.
+    """
+    combined = storage_dir / "combined_vex.json"
+    if combined.exists():
+        try:
+            doc = json.loads(combined.read_text(encoding="utf-8"))
+            aff = na = ui = 0
+            for stmt in doc.get("statements", []):
+                st = stmt.get("status")
+                if st == "affected":
+                    aff += 1
+                elif st == "not_affected":
+                    na += 1
+                elif st == "under_investigation":
+                    ui += 1
+            return (aff, na, ui)
+        except Exception:
+            pass
+
+    vex_dir = storage_dir / "vex"
+    if not vex_dir.exists():
+        return None
+    aff = na = ui = 0
+    for f in vex_dir.glob("*_vex.json"):
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8"))
+            for stmt in doc.get("statements", []):
+                st = stmt.get("status")
+                if st == "affected":
+                    aff += 1
+                elif st == "not_affected":
+                    na += 1
+                elif st == "under_investigation":
+                    ui += 1
+        except Exception:
+            continue
+    return (aff, na, ui)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +334,14 @@ async def get_job_result(job_id: str) -> JobResult:
         for v in raw_vulns
     ]
 
+    # VEX 집계는 ``jobs`` 테이블의 캐시 컬럼이 아니라 **현 시점 cve_results**
+    # 에서 실시간 재계산한다.  Resume/Retry 를 여러 번 돌리면 runner 의
+    # incremental 카운터가 0 부터 다시 시작해 stale 해지는 케이스가 있어
+    # ``combined_vex`` / on-disk 결과와 뱃지가 어긋나던 문제를 막는다.
+    live_affected = sum(1 for c in cve_results if c.vex_status == "affected")
+    live_not_affected = sum(1 for c in cve_results if c.vex_status == "not_affected")
+    live_investigating = sum(1 for c in cve_results if c.vex_status == "under_investigation")
+
     return JobResult(
         id=job["id"],
         filename=job["filename"],
@@ -293,9 +355,9 @@ async def get_job_result(job_id: str) -> JobResult:
         high_cves=job.get("high_cves", 0),
         medium_cves=job.get("medium_cves", 0),
         low_cves=job.get("low_cves", 0),
-        not_affected_count=job.get("not_affected_count", 0),
-        affected_count=job.get("affected_count", 0),
-        under_investigation_count=job.get("under_investigation_count", 0),
+        not_affected_count=live_not_affected,
+        affected_count=live_affected,
+        under_investigation_count=live_investigating,
         cve_results=cve_results,
         vex_document=vex_document,
         stage_timings=stage_timings,

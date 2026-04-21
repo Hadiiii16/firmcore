@@ -163,12 +163,21 @@ start_backend() {
     info "백엔드 시작 → http://localhost:8080"
   fi
 
+  # ``--reload`` 는 파일 저장 때마다 uvicorn 워커를 교체하는데, 진행 중
+  # Gemini 서브프로세스는 PR_SET_PDEATHSIG 로 워커가 죽을 때 같이 종료된다.
+  # VEX 분석 도중에 코드 수정이 일어나면 분석이 중간에 kill 되는 증상이
+  # 있으므로 기본은 --reload 꺼짐.  개발용으로 켜고 싶으면
+  # ``FIRMCORE_RELOAD=1 ./start.sh`` 로 실행.
+  reload_args=()
+  if [[ "${FIRMCORE_RELOAD:-0}" == "1" ]]; then
+    reload_args=(--reload --reload-dir "$SCRIPT_DIR/backend")
+    info "uvicorn --reload 활성 (개발 모드). 분석 중 코드 수정은 분석을 중단시킵니다."
+  fi
   env "${BACKEND_ENV[@]}" \
     uvicorn main:app \
       --host 0.0.0.0 \
       --port 8080 \
-      --reload \
-      --reload-dir "$SCRIPT_DIR/backend" \
+      "${reload_args[@]}" \
       --app-dir "$SCRIPT_DIR/backend" \
       --log-level info \
     &

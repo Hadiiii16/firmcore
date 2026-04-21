@@ -1,4 +1,4 @@
-import { useState, type MouseEvent } from 'react'
+import { useMemo, useState, type MouseEvent } from 'react'
 import { RefreshCw, Bot, ChevronDown, ChevronRight, FastForward } from 'lucide-react'
 import { SeverityBadge, VexBadge } from '../../components/Badge'
 import type { CveResult, JobStatus } from '../../types'
@@ -12,18 +12,36 @@ interface VexAnalysisTabProps {
   jobStatus: JobStatus | null
 }
 
-// Order within the table: urgent first, then deprioritised, then resolved.
-// Affected w/ exploitability_tier === 'low' sorts *after* standard-affected
-// since its patch priority is lower.
+// 기본 정렬은 severity — 백엔드 ``_select_cves_for_vex`` 와 동일해야
+// Resume from here 인덱스가 일치한다.  사용자가 sort dropdown 으로
+// vex / cve 를 선택하면 그때만 다른 기준 사용.
+const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NEGLIGIBLE', 'UNKNOWN']
+// affected (standard) → affected (low) → investigating → not_affected → fixed
 const VEX_ORDER = ['affected', 'affected_low', 'under_investigation', 'not_affected', 'fixed']
 
-function vexOrder(cve: CveResult) {
-  const key =
-    cve.vex_status === 'affected' && cve.exploitability_tier === 'low'
-      ? 'affected_low'
-      : (cve.vex_status ?? '')
-  const idx = VEX_ORDER.indexOf(key)
-  return idx === -1 ? VEX_ORDER.length : idx
+type SortKey = 'severity' | 'vex' | 'cve'
+type VexFilter = 'all' | 'affected' | 'affected_low' | 'not_affected' | 'under_investigation' | 'fixed' | 'unknown'
+
+function vexKey(c: CveResult): string {
+  if (c.vex_status === 'affected' && c.exploitability_tier === 'low') return 'affected_low'
+  return c.vex_status ?? ''
+}
+
+function sortCves(list: CveResult[], key: SortKey): CveResult[] {
+  return [...list].sort((a, b) => {
+    if (key === 'vex') {
+      const va = VEX_ORDER.indexOf(vexKey(a))
+      const vb = VEX_ORDER.indexOf(vexKey(b))
+      const ai = va === -1 ? VEX_ORDER.length : va
+      const bi = vb === -1 ? VEX_ORDER.length : vb
+      if (ai !== bi) return ai - bi
+      return SEV_ORDER.indexOf(a.severity) - SEV_ORDER.indexOf(b.severity)
+    }
+    if (key === 'cve') {
+      return a.cve_id.localeCompare(b.cve_id)
+    }
+    return SEV_ORDER.indexOf(a.severity) - SEV_ORDER.indexOf(b.severity)
+  })
 }
 
 export function VexAnalysisTab({
@@ -36,6 +54,8 @@ export function VexAnalysisTab({
 }: VexAnalysisTabProps) {
   const canRetry = jobStatus === 'completed' || jobStatus === 'failed' || jobStatus === 'vex_analyzing'
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [sortKey, setSortKey] = useState<SortKey>('severity')
+  const [vexFilter, setVexFilter] = useState<VexFilter>('all')
 
   const toggle = (cveId: string) => {
     setExpanded((prev) => {
@@ -46,11 +66,46 @@ export function VexAnalysisTab({
     })
   }
 
-  const withVex = cves
-    .filter((c) => c.vex_status && c.vex_status !== 'unknown')
-    .sort((a, b) => vexOrder(a) - vexOrder(b))
+  // VEX 상태별 카운트 (한 번만 계산)
+  const stats = useMemo(() => {
+    const s = {
+      total: cves.length,
+      affected: 0,        // standard tier
+      affected_low: 0,
+      not_affected: 0,
+      under_investigation: 0,
+      fixed: 0,
+      unknown: 0,         // 분석 미실행
+    }
+    for (const c of cves) {
+      if (!c.vex_status || c.vex_status === 'unknown') { s.unknown++; continue }
+      if (c.vex_status === 'affected') {
+        if (c.exploitability_tier === 'low') s.affected_low++
+        else s.affected++
+      } else if (c.vex_status === 'not_affected') s.not_affected++
+      else if (c.vex_status === 'under_investigation') s.under_investigation++
+      else if (c.vex_status === 'fixed') s.fixed++
+    }
+    return s
+  }, [cves])
 
-  const noVex = cves.filter((c) => !c.vex_status || c.vex_status === 'unknown')
+  const analyzed = stats.total - stats.unknown
+  const coverage = stats.total > 0 ? Math.round((analyzed / stats.total) * 100) : 0
+
+  const matchesFilter = (c: CveResult): boolean => {
+    if (vexFilter === 'all') return true
+    const key = vexKey(c) || 'unknown'
+    return key === vexFilter
+  }
+
+  const withVex = sortCves(
+    cves.filter((c) => c.vex_status && c.vex_status !== 'unknown' && matchesFilter(c)),
+    sortKey,
+  )
+  const noVex = sortCves(
+    cves.filter((c) => (!c.vex_status || c.vex_status === 'unknown') && (vexFilter === 'all' || vexFilter === 'unknown')),
+    sortKey,
+  )
 
   if (cves.length === 0) {
     return (
@@ -59,6 +114,17 @@ export function VexAnalysisTab({
       </div>
     )
   }
+
+  // 필터 pill 정의 (key, label, count, class tokens)
+  const filterPills: Array<{ key: VexFilter; label: string; count: number; active: string; inactive: string }> = [
+    { key: 'all',                 label: 'ALL',         count: stats.total,              active: 'bg-surface-700 text-gray-100 border-surface-500', inactive: 'bg-surface-800/60 text-gray-400 border-surface-700 hover:bg-surface-700/60' },
+    { key: 'affected',            label: 'AFFECTED',    count: stats.affected,           active: 'bg-red-900/60 text-red-200 border-red-700',        inactive: 'bg-red-900/15 text-red-400 border-red-900/40 hover:bg-red-900/30' },
+    { key: 'affected_low',        label: 'AFF·LOW',     count: stats.affected_low,       active: 'bg-orange-900/60 text-orange-200 border-orange-700', inactive: 'bg-orange-900/15 text-orange-400 border-orange-900/40 hover:bg-orange-900/30' },
+    { key: 'not_affected',        label: 'NOT AFFECTED', count: stats.not_affected,      active: 'bg-green-900/60 text-green-200 border-green-700',  inactive: 'bg-green-900/15 text-accent-green border-green-900/40 hover:bg-green-900/30' },
+    { key: 'under_investigation', label: 'INVESTIGATING', count: stats.under_investigation, active: 'bg-amber-900/60 text-amber-200 border-amber-700', inactive: 'bg-amber-900/15 text-amber-400 border-amber-900/40 hover:bg-amber-900/30' },
+    { key: 'fixed',               label: 'FIXED',       count: stats.fixed,              active: 'bg-blue-900/60 text-blue-200 border-blue-700',     inactive: 'bg-blue-900/15 text-blue-400 border-blue-900/40 hover:bg-blue-900/30' },
+    { key: 'unknown',             label: 'UNANALYZED',  count: stats.unknown,            active: 'bg-surface-700 text-gray-100 border-surface-500',  inactive: 'bg-surface-800/60 text-gray-500 border-surface-700 hover:bg-surface-700/60' },
+  ]
 
   function RetryButton({ cveId }: { cveId: string }) {
     const isThis = retryingCve === cveId
@@ -102,15 +168,17 @@ export function VexAnalysisTab({
   }
 
   return (
-    <div className="space-y-6">
-      {/* Summary */}
-      <div className="flex items-center justify-between gap-2 text-sm text-gray-400">
-        <div className="flex items-center gap-2">
-          <Bot size={15} className="text-accent-amber" />
-          <span className="font-mono">
-            {withVex.length} VEX statements generated · {noVex.length} without analysis
-          </span>
-        </div>
+    <div className="space-y-5">
+      {/* ─── VEX Summary 헤더 ─── */}
+      <div className="flex items-center gap-3 text-sm text-gray-400">
+        <Bot size={15} className="text-accent-amber shrink-0" />
+        <span className="font-mono text-gray-300">
+          VEX analysis coverage
+        </span>
+        <span className="font-mono text-accent-cyan font-semibold">
+          {analyzed} / {stats.total}
+        </span>
+        <span className="font-mono text-gray-600">({coverage}%)</span>
         {withVex.length > 0 && (
           <button
             onClick={() =>
@@ -118,11 +186,40 @@ export function VexAnalysisTab({
                 prev.size === withVex.length ? new Set() : new Set(withVex.map((c) => c.cve_id)),
               )
             }
-            className="text-xs font-mono text-gray-500 hover:text-accent-cyan transition-colors"
+            className="ml-auto text-xs font-mono text-gray-500 hover:text-accent-cyan transition-colors"
           >
             {expanded.size === withVex.length ? 'Collapse all' : 'Expand all'}
           </button>
         )}
+      </div>
+
+      {/* ─── Filter pills: VEX 상태별 카운트 + 토글 ─── */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {filterPills.map(({ key, label, count, active, inactive }) => (
+          <button
+            key={key}
+            onClick={() => setVexFilter(key)}
+            disabled={count === 0 && key !== 'all'}
+            className={`px-3 py-1 rounded-full text-xs font-mono border transition-colors whitespace-nowrap
+              ${vexFilter === key ? active : inactive}
+              ${count === 0 && key !== 'all' ? 'opacity-40 cursor-not-allowed' : ''}`}
+          >
+            {label} <span className="ml-1 font-bold">{count}</span>
+          </button>
+        ))}
+        {/* Sort dropdown */}
+        <div className="ml-auto flex items-center gap-2">
+          <label className="text-xs font-mono text-gray-500">Sort</label>
+          <select
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value as SortKey)}
+            className="px-2 py-1 rounded text-xs font-mono bg-surface-800 text-gray-300 border border-surface-600 focus:outline-none focus:border-accent-cyan"
+          >
+            <option value="severity">Severity</option>
+            <option value="vex">VEX status</option>
+            <option value="cve">CVE ID</option>
+          </select>
+        </div>
       </div>
 
       {/* VEX rows — collapsed by default, click header to expand */}

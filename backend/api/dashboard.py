@@ -108,11 +108,19 @@ async def dashboard_summary() -> DashboardSummary:
     affected_with_fix_count = 0
 
     for r in rows:
-        if r.get("status") != "completed":
+        # scan.json 만 있으면 집계 가능하다.  status 가 ``completed`` 가
+        # 아니어도 (vex_analyzing 진행 중 / failed 로 중단되었어도)
+        # 이미 완료된 부분 분석 결과는 vex_map 에 반영되어 있으므로 대시
+        # 보드에 노출해 준다.  ``pending`` / ``extracting`` / ``sbom_*`` /
+        # ``scanning`` 상태는 아직 scan.json 이 없어 제외.
+        status = r.get("status")
+        if status in ("pending", "extracting", "sbom_generating", "scanning"):
             continue
         job_id = r["id"]
         storage_dir = Path(r["storage_dir"]) if r.get("storage_dir") else None
         if not storage_dir:
+            continue
+        if not (storage_dir / "scan.json").exists():
             continue
 
         scan = _load_scan_results(storage_dir, r.get("scan_result_path"))

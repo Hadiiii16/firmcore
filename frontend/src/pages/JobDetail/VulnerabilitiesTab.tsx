@@ -172,10 +172,10 @@ export function VulnerabilitiesTab({ cves }: VulnerabilitiesTabProps) {
       if (sortKey === 'risk') {
         return (b.risk_score ?? -1) - (a.risk_score ?? -1)
       }
-      // Severity primary, then CVSS to break ties.
-      const sevDiff = SEV_ORDER.indexOf(a.severity) - SEV_ORDER.indexOf(b.severity)
-      if (sevDiff !== 0) return sevDiff
-      return (b.cvss_base_score ?? -1) - (a.cvss_base_score ?? -1)
+      // Severity 만.  같은 severity 안에서는 원본 순서 유지 → stable
+      // sort.  백엔드 ``_select_cves_for_vex`` / VexAnalysisTab 의
+      // ``sortCves`` 도 동일 규칙이라 Resume from here 인덱스가 일치한다.
+      return SEV_ORDER.indexOf(a.severity) - SEV_ORDER.indexOf(b.severity)
     })
   }, [cves, filter, sevFilter, sortKey])
 

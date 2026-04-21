@@ -138,10 +138,12 @@ VEX_EMIT_HASH_WINDOW = int(_get_env("VEX_EMIT_HASH_WINDOW", "2000"))
 # median 158, mean 404, max ~3900 chars — the 96th percentile is 1600.
 VEX_DESC_MAX_CHARS = int(_get_env("VEX_DESC_MAX_CHARS", "0"))
 # PTY viewport width (columns).  Ink renders every box at terminal width,
-# so wider = boxes with more empty padding that wrap in fixed-width log
-# viewers.  140 fits typical browser/code-editor widths without cramping
-# Shell output (file paths, nm symbols ≈ 60 cols).
-VEX_PTY_COLUMNS = int(_get_env("VEX_PTY_COLUMNS", "100"))
+# so wider = boxes with more empty padding but narrower = long grep/find
+# output wraps inside the box and the wrapped fragment shows up on a
+# separate line (e.g. ``# ...we cannot be certai`` + ``n we have the``)
+# out of order.  200 cols accomodates most file paths + grep hits without
+# wrapping; narrow log viewers still cope fine.
+VEX_PTY_COLUMNS = int(_get_env("VEX_PTY_COLUMNS", "200"))
 VEX_PTY_LINES = int(_get_env("VEX_PTY_LINES", "80"))
 
 # CVE 간 딜레이 (Gemini rate limit 방지)
@@ -862,14 +864,15 @@ async def stream_gemini_yolo(
     # replayed *after* the final text when the buffer eventually flushes.
     pending_stream_text: Optional[str] = None
     pending_trailing_blanks: int = 0
-    # Viewport snapshot from the previous incremental flush.  Used to
-    # detect "stable" rows — rows whose content did not change between
-    # two consecutive scans.  Gemini streams tokens into a single row as
-    # it generates the response, so a row that is still changing is still
-    # being written and must not be emitted yet (otherwise we get partial
-    # fragments like "…zlib 라이브러리의 `inflate." before the full
-    # sentence materialises).
+    # Viewport snapshots from the two previous incremental flushes.  A row
+    # is "stable" only if it is identical across **three** consecutive
+    # scans (current == prev == prev_prev).  Two-scan stability still let
+    # the occasional "nearly complete" partial slip through as a fragment
+    # (e.g. "✦ 분석 결과, 취약한 라이브러리(`libz.so.1.2.11" followed by
+    # the full version on the next chunk); requiring three scans adds
+    # ≈1-2s latency but eliminates these fragments.
     prev_viewport: list[str] = []
+    prev_prev_viewport: list[str] = []
     # Hash set of already-emitted non-blank lines.  Used to deduplicate when
     # the same viewport line is rescanned across chunks and again when it
     # scrolls into history.  Backed by a deque for FIFO eviction.
@@ -879,7 +882,6 @@ async def stream_gemini_yolo(
     # shortcut hints, etc.).  Filter them when they appear.
     _CHROME_BLOCK = re.compile(
         r"^[▄▀─]{4,}\s*$"
-        r"|Analyzing the CVE.*esc to cancel"
         r"|\?\s+for shortcuts"
         r"|YOLO\s+Ctrl\+[A-Z]"
         r"|GEMINI\.md file"
@@ -889,7 +891,16 @@ async def stream_gemini_yolo(
         r"|\(Ctrl\+O to (?:show|hide)\)"
         r"|Press Ctrl\+O to show more"  # status footer during long output
         r"|^\s*Auto \(Gemini\s"  # model indicator in footer
-        r"|esc to cancel\)"  # trailing status from thinking state
+        # Gemini v0.38.2+ renders *every* transient status line with a
+        # Braille spinner (U+2800..U+28FF) followed by a phrase like
+        # "Analyzing the Vulnerability (esc to cancel, 7s)".  The status
+        # phrase keeps changing (Analyzing → Examining → Outlining →
+        # Thinking), so matching on the phrase alone misses variants.
+        # Drop any line that contains either "esc to cancel" OR starts
+        # with a Braille spinner glyph — both are guaranteed-ephemeral
+        # UI chrome.
+        r"|esc to cancel"
+        r"|^\s*[⠀-⣿]\s"
         r"|^\*\s+Type your message",
         re.IGNORECASE,
     )
@@ -952,43 +963,26 @@ async def stream_gemini_yolo(
     emitted_box_order: deque[str] = deque(maxlen=256)
 
     # WriteFile diff suppression.  Gemini CLI prints a numbered diff preview
-    # after WriteFile accepts, which for our OpenVEX JSON flood the log with
-    # content that's already saved to disk.  Enter suppress mode when we see
-    # a WriteFile "Accepted"/"written" header, then skip blank lines and
-    # ``^\s*\d+\s`` diff rows until we see a non-diff non-blank line.
-    _RE_WRITEFILE_HEADER = re.compile(
-        r"WriteFile\s+\S+.*(?:Accepted|written|saved|successfully)",
-        re.IGNORECASE,
-    )
-    # Match lines like "     4" (empty content) or "     5 ■ CVE ID: …".
-    # The trailing-whitespace-required form broke on empty diff rows,
-    # which exited suppress mode and leaked the rest of the diff.
+    # after WriteFile accepts (for our OpenVEX JSON / report.md this duplicates
+    # what's already saved to disk).  The previous stateful approach toggled
+    # off the moment a non-diff line appeared — Gemini interleaves
+    # "✦ 자료를 저장" style commentary between the header and the actual diff
+    # body, so the toggle flipped early and the diff body leaked.
+    #
+    # New rule: drop **any** numbered-prefix line outright.  ``^\s*\d+(?:\s|$)``
+    # never matches our legitimate output: boxes are wrapped in ``│``, report
+    # numbered lists always use ``1.`` (followed by a dot, not whitespace),
+    # and ``✦``/commentary lines start with non-digit glyphs.
     _RE_WRITEFILE_DIFF = re.compile(r"^\s*\d+(?:\s|$)")
-    writefile_suppress = [False]  # list for closure mutability
 
     def _suppress_check(text: str) -> bool:
         """Return True if ``text`` should be dropped as WriteFile diff body."""
-        stripped = text.strip()
-        if not stripped:
-            return writefile_suppress[0]  # keep skipping blanks while suppressed
-        if writefile_suppress[0]:
-            # Keep suppressing while inside the diff body.  Covers three
-            # shapes Gemini's ``Writefile ... Accepted`` preview emits:
-            #   1. numbered rows  "     5 ■ CVE ID: ..."
-            #   2. empty numbered "     4"  (regex with trailing \s failed
-            #      here — hence the \s|$ alternative)
-            #   3. wrapped string continuations with no line number but
-            #      heavy indentation: "           Therefore, ..."
-            # Any of these start with ≥4 leading whitespace characters.
-            # A less-indented / unindented line signals the diff preview
-            # is over (next ✦ message, box border, etc.) — exit suppress.
-            if _RE_WRITEFILE_DIFF.match(text) or text.startswith("    "):
-                return True
-            writefile_suppress[0] = False
-            return False
-        if _RE_WRITEFILE_HEADER.search(stripped):
-            writefile_suppress[0] = True
-        return False
+        return bool(_RE_WRITEFILE_DIFF.match(text))
+
+    # Keep the pre-submit suppression flag alongside writefile's — this one is
+    # toggled by ``_read_pty`` the moment we auto-submit the initial prompt,
+    # so the banner + prefilled prompt box never reach the log.
+    pre_submit_suppress = [True]
 
     async def _emit_raw(text: str) -> None:
         """Emit a single line without per-line hash dedup.
@@ -1005,6 +999,12 @@ async def stream_gemini_yolo(
         stripped = text.strip()
         if stripped and _is_gemini_rate_limit(stripped):
             raise RuntimeError(f"[RATE_LIMIT] {stripped}")
+        # Drop everything until we auto-submit the prefilled prompt.  This
+        # covers the ASCII-art banner, the "Positional arguments now default
+        # to interactive mode" hint, and the prefilled prompt box that Ink
+        # renders from our own prompt text — all of which are noise.
+        if pre_submit_suppress[0]:
+            return
         if stripped and _CHROME_BLOCK.search(text):
             return
         if _suppress_check(text):
@@ -1032,6 +1032,8 @@ async def stream_gemini_yolo(
         stripped = text.strip()
         if stripped and _is_gemini_rate_limit(stripped):
             raise RuntimeError(f"[RATE_LIMIT] {stripped}")
+        if pre_submit_suppress[0]:
+            return
         if stripped and _CHROME_BLOCK.search(text):
             return
         if _suppress_check(text):
@@ -1087,6 +1089,10 @@ async def stream_gemini_yolo(
         and box rows flush the buffer first, preserving order.
         """
         nonlocal pending_stream_text, pending_trailing_blanks
+        # Drop everything before the prefilled prompt has been submitted —
+        # includes banner ASCII art and our own prompt echoed back by Ink.
+        if pre_submit_suppress[0]:
+            return
         stripped = text.strip()
         if not stripped:
             if pending_stream_text is None:
@@ -1107,8 +1113,21 @@ async def stream_gemini_yolo(
         if text in emitted_hashes or _CHROME_BLOCK.search(text):
             return
         if pending_stream_text is not None:
-            pending_stripped = pending_stream_text.strip()
-            if stripped.startswith(pending_stripped):
+            # Normalise markdown heading/emphasis markers before the
+            # prefix comparison.  Ink's Markdown renderer shows ``**``
+            # during the first streaming passes and removes it once the
+            # heading stabilises — without stripping we'd see partial
+            # "**1단계: 라이브러리 레" leak out, then a second
+            # "1단계: 라이브러리 레벨 분석" emitted separately.
+            def _norm(s: str) -> str:
+                s = s.strip()
+                # Repeatedly peel "*"/"#" markers + whitespace.
+                while s and s[0] in "*#":
+                    s = s.lstrip("*#").lstrip()
+                return s
+            pending_norm = _norm(pending_stream_text)
+            new_norm = _norm(text)
+            if pending_norm and new_norm.startswith(pending_norm):
                 # Replace text; keep any trailing-blank count — the
                 # blanks follow the *final* form of this sentence too.
                 pending_stream_text = text
@@ -1117,7 +1136,23 @@ async def stream_gemini_yolo(
         pending_stream_text = text
 
     async def _emit_box(rows: list[str]) -> None:
-        """Emit a ╭…╰ box atomically, deduped by header key."""
+        """Emit a ╭…╰ box atomically, deduped by header key.
+
+        The box frame itself (``╭─...─╮`` top, ``│ ... │`` sides,
+        ``╰─...─╯`` bottom) is **stripped** — we just render the content
+        with a small indent prefix.  This keeps logs readable on narrow
+        terminals where 200-column frames would wrap/tear, while the
+        pyte viewport stays wide enough that the box content itself
+        never wraps internally.
+
+        Format:
+            ✓ Shell <header>
+              <body-line-1>
+              <body-line-2>
+              ...
+        """
+        if pre_submit_suppress[0]:
+            return
         if _box_is_transient(rows):
             return  # wait for ✓/✗ final state
         key = _box_header_key(rows)
@@ -1130,22 +1165,71 @@ async def stream_gemini_yolo(
             emitted_box_keys.discard(old)
         emitted_box_order.append(key)
         emitted_box_keys.add(key)
-        # WriteFile boxes contain a line-numbered diff of the written file,
-        # which for OpenVEX JSON / report.md is redundant with the on-disk
-        # artifacts.  Keep only the top/bottom borders and the header row.
-        if "WriteFile" in key:
-            if rows:
-                await _emit_raw(rows[0])  # ╭─...─╮
-            for row in rows[1:-1]:
-                s = row.strip()
-                if s.startswith("│") and "WriteFile" in s:
-                    await _emit_raw(row)
-                    break
-            if len(rows) >= 2:
-                await _emit_raw(rows[-1])  # ╰─...─╯
-            return
+
+        def _unwrap(row: str) -> Optional[str]:
+            """Strip the ``│ `` prefix and `` │`` suffix from a box side
+            row; return ``None`` for border rows (╭─...╮ / ╰─...╯ / ├─┤
+            separators) which should be discarded."""
+            s = row.rstrip()
+            if not s:
+                return ""
+            stripped = s.lstrip()
+            if not stripped:
+                return ""
+            first = stripped[0]
+            if first in "╭╮╰╯├┤┬┴┼─━":
+                return None  # border row — drop
+            if first == "│":
+                inner = stripped[1:]
+                # trailing │ (may be followed by trailing spaces)
+                inner = inner.rstrip()
+                if inner.endswith("│"):
+                    inner = inner[:-1]
+                return inner.rstrip()
+            return s  # non-standard row, keep as-is
+
+        # Header: first side row is ``│ ✓ Shell <command> │``.  Emit it
+        # without the indent prefix so it stands out as the "action".
+        header_body: Optional[str] = None
+        body_lines: list[str] = []
         for row in rows:
-            await _emit_raw(row)
+            unwrapped = _unwrap(row)
+            if unwrapped is None:
+                continue
+            if header_body is None and unwrapped.strip():
+                header_body = unwrapped.strip()
+                continue
+            body_lines.append(unwrapped)
+
+        # Trim trailing empty content rows (box padding).
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+
+        # WriteFile boxes: body is a numbered diff of the written file.
+        # Skip the body entirely — it duplicates what's on disk.
+        is_writefile = bool(header_body and "WriteFile" in header_body)
+
+        # Visual delimiter so the Shell output block is easy to spot in
+        # the scrolling log — much lighter than a full box but still
+        # clearly scoped.  Fixed 60-char width to stay readable on
+        # terminals as narrow as 80 cols.  Both bars include the "Shell"
+        # label so ``_CHROME_BLOCK`` 의 ``^[▄▀─]{4,}\s*$`` 순수 ──-only
+        # 필터에 걸리지 않는다.
+        SHELL_BAR_OPEN = "─── Shell ──────────────────────────────────────────────"
+        SHELL_BAR_CLOSE = "──────────────────────────────────── end Shell ─────────"
+        await _emit_raw(SHELL_BAR_OPEN)
+        if header_body:
+            await _emit_raw(header_body)
+        if is_writefile:
+            await _emit_raw(SHELL_BAR_CLOSE)
+            return
+        for line in body_lines:
+            if not line.strip():
+                # Preserve intentional blank separators as a single empty line.
+                await _emit_raw("")
+                continue
+            await _emit_raw(f"  {line.strip()}")
+        await _emit_raw(SHELL_BAR_CLOSE)
 
     async def _emit_rows(rows: list[str]) -> int:
         """Emit ``rows`` with box-aware handling.
@@ -1230,30 +1314,38 @@ async def stream_gemini_yolo(
         re-emission.  Non-box lines flush through the normal hash-dedup
         path; bare │ fragments (growing-box leftovers) are dropped.
         """
-        nonlocal prev_viewport
+        nonlocal prev_viewport, prev_prev_viewport
         rows = [_line_to_text(pyte_screen.buffer[r]) for r in range(pyte_screen.lines)]
         last_nonempty = len(rows) - 1
         while last_nonempty >= 0 and not rows[last_nonempty].strip():
             last_nonempty -= 1
         if last_nonempty < 0:
+            prev_prev_viewport = prev_viewport
             prev_viewport = list(rows)
             return
         tail_end = max(0, last_nonempty - VEX_PTY_UI_TAIL_LINES + 1)
-        # Find first unstable row within the candidate emit range.  We
-        # only trust rows that match the previous scan verbatim.
+        # A row is stable only if three consecutive scans see the same
+        # text.  First unstable row halts emission for this tick.
         stable_end = tail_end
         for i in range(tail_end):
-            if i >= len(prev_viewport) or prev_viewport[i] != rows[i]:
+            stable = (
+                i < len(prev_viewport)
+                and i < len(prev_prev_viewport)
+                and prev_viewport[i] == rows[i]
+                and prev_prev_viewport[i] == rows[i]
+            )
+            if not stable:
                 stable_end = i
                 break
         if stable_end > 0:
             await _emit_rows(rows[:stable_end])
+        prev_prev_viewport = prev_viewport
         prev_viewport = list(rows)
 
     # ── PTY reader task ───────────────────────────────────────────────────
 
     async def _read_pty() -> None:
-        nonlocal final_detected
+        nonlocal final_detected, emitted_history_count
         last_chunk_ts = time.monotonic()
         got_any_output = False
         # When both staging files first appear on disk we start a short
@@ -1393,7 +1485,7 @@ async def stream_gemini_yolo(
                             os.write(pty_write_fd, b"\r\n")
                             initial_submitted = True
                             logger.info(
-                                "[VEX] %s auto-submitted initial prompt (%s)",
+                                "[VEX] %s auto-submitted initial prompt (%s); suppressing output until first ✦",
                                 cve_id,
                                 "prefill" if prefill_seen else "fallback timer",
                             )
@@ -1402,6 +1494,41 @@ async def stream_gemini_yolo(
                                 "[VEX] %s initial Enter failed: %s",
                                 cve_id, write_exc,
                             )
+
+                # Release the emit gate only once Gemini actually starts
+                # generating its own response.  The ``✦`` glyph is the
+                # first character Gemini writes before any analysis
+                # commentary.  Waiting for it (instead of releasing at
+                # Enter time) guarantees banner + prefilled prompt have
+                # fully scrolled out before we start emitting, so none
+                # of that leaks regardless of pyte text-extraction edge
+                # cases.
+                if initial_submitted and pre_submit_suppress[0]:
+                    if "✦" in viewport_now:
+                        pre_submit_suppress[0] = False
+                        # Skip everything that scrolled out of the
+                        # viewport while we were in suppress mode.
+                        emitted_history_count = len(pyte_screen.history.top)
+                        # Also poison whatever is currently sitting in
+                        # the viewport — Ink's redraw cycles may push
+                        # some of it to history in the next few chunks.
+                        for _r in range(pyte_screen.lines):
+                            _row = _line_to_text(pyte_screen.buffer[_r])
+                            if not _row.strip():
+                                continue
+                            # Keep the ✦-starting row visible — that's
+                            # the first real output line, we want it.
+                            if _row.lstrip().startswith("✦"):
+                                continue
+                            if len(emitted_order) == emitted_order.maxlen:
+                                _old = emitted_order[0]
+                                emitted_hashes.discard(_old)
+                            emitted_order.append(_row)
+                            emitted_hashes.add(_row)
+                        logger.info(
+                            "[VEX] %s response stream detected; emit gate opened",
+                            cve_id,
+                        )
 
                 # Keep a raw-decoded copy for OpenVEX JSON detection.
                 # We *cannot* strip ANSI per-chunk here: escape sequences like

@@ -337,10 +337,38 @@ async def run_vex_single(job_id: str, cve_id: str) -> None:
                             error_message=None, completed_at=None)
 
     from pipeline.scanner import ScanResult, Vulnerability
-    # 단일 CVE용 더미 ScanResult
+    # scan.json 에서 해당 CVE 의 실제 메타데이터(description, package,
+    # severity 등) 를 읽어 Vulnerability 객체를 복원한다.  이전에는
+    # 빈 값 가상 Vulnerability 로 채워서 Gemini 프롬프트에 CVE 맥락이
+    # 전혀 실리지 않아 "취약 컴포넌트 정보 누락" 이라며 분석이 실패
+    # 했다.  scan.json 이 없거나 해당 CVE 가 없을 때만 가상 객체로
+    # 폴백.
+    real_vuln: Optional[Vulnerability] = None
+    scan_json = storage_dir / "scan.json"
+    if scan_json.exists():
+        try:
+            _data = json.loads(scan_json.read_text(encoding="utf-8"))
+            for v in _parse_scan_vulns(_data):
+                if v.cve_id == cve_id:
+                    real_vuln = v
+                    break
+        except Exception as exc:
+            logger.warning(
+                "[Runner] %s scan.json 에서 %s 메타데이터 조회 실패: %s",
+                job_id, cve_id, exc,
+            )
+    if real_vuln is None:
+        logger.warning(
+            "[Runner] %s scan.json 에 %s 메타데이터 없음 → 빈 맥락으로 분석",
+            job_id, cve_id,
+        )
+        real_vuln = Vulnerability(
+            cve_id=cve_id, package_name="", package_version="",
+            severity="UNKNOWN", description="", fix_version=None, urls=[],
+        )
+
     scan_result = ScanResult(
-        vulnerabilities=[Vulnerability(cve_id=cve_id, package_name="", package_version="",
-                                       severity="UNKNOWN", description="", fix_version=None, urls=[])],
+        vulnerabilities=[real_vuln],
         counts_by_severity={},
         total_count=1,
         log=[],
@@ -760,6 +788,12 @@ def _select_cves_for_vex(vulns: list[Vulnerability]) -> list[str]:
     """
     VEX 분석 대상 CVE를 severity 우선순위 기준으로 반환합니다.
     중복 CVE ID 제거, Critical/High/Medium/Low 순 정렬.
+
+    같은 severity 내에서는 **scan.json 원래 순서를 유지**한다 (Python
+    ``sorted`` 는 stable).  프론트엔드 VulnerabilitiesTab /
+    VexAnalysisTab 도 ``Array.prototype.sort`` 는 stable 이고 severity
+    만으로 정렬하므로 같은 순서가 보장된다 → Resume from here 인덱스도
+    정확히 맞는다.
     """
     seen: set[str] = set()
     unique: list[Vulnerability] = []
