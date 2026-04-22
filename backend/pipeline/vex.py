@@ -100,9 +100,17 @@ def _get_env(name: str, default: str) -> str:
 
 
 GEMINI_TIMEOUT = int(_get_env("VEX_GEMINI_TIMEOUT", "1800"))  # seconds per Gemini CLI call (30min default)
-# Model selection.  "auto"/"default" are sentinels — _gemini_process_args
-# omits the --model flag for them, so the CLI picks its own default and
-# can fall back (e.g. Pro → Flash) on rate-limit without us intervening.
+# Model selection.  .env 의 ``GEMINI_MODEL`` / ``GEMINI_MODELS`` 값이
+# 그대로 CLI 의 ``--model`` 인자로 전달된다.
+#   - ``auto`` / ``default``            : ``--model`` 인자 생략 → CLI
+#        자체 라우팅(Auto Gemini 3 등) 사용.  쿼터 소진 시 Flash 로
+#        폴백하는 fallback 동작은 CLI 내장 ``ModelAvailabilityService``
+#        에 맡긴다.
+#   - ``gemini-3-pro-preview`` 등 구체명 : 해당 모델 고정.  폴백 없이
+#        그 모델의 서브쿼터가 소진되면 ``_is_gemini_rate_limit`` 이
+#        감지해 batch 를 중단하고 사용자가 Resume 하는 구조.
+# 쉼표 분리 리스트도 허용하지만 현재 구현에선 첫 번째 항목만 사용
+# (legacy — 모델 리스트 순회 로직은 제거됨).
 GEMINI_MODELS = [
     model.strip()
     for model in _get_env(
@@ -112,8 +120,8 @@ GEMINI_MODELS = [
     if model.strip()
 ] or ["auto"]
 GEMINI_MODEL = GEMINI_MODELS[0]
-# Pro 에서 rate-limit 에 걸리면 즉시 중단하고 사용자가 resume 하도록 한다.
-# 내부 자동 재시도는 하지 않으므로 retry cycle 은 1 로 고정(환경변수 무시).
+# 현재 rate-limit 발생 시 내부 자동 재시도를 하지 않고 사용자가 Resume
+# 하는 구조이므로 retry cycle 은 1 로 고정 (환경변수 무시).
 GEMINI_MODEL_RETRY_CYCLES = 1
 GEMINI_HEARTBEAT_INTERVAL = int(_get_env("VEX_GEMINI_HEARTBEAT_INTERVAL", "30"))
 GEMINI_STREAM_LOG_CHARS = int(_get_env("VEX_GEMINI_STREAM_LOG_CHARS", "800"))
