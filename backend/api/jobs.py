@@ -330,6 +330,7 @@ async def get_job_result(job_id: str) -> JobResult:
             vex_justification=vex_map.get(v["cve_id"], {}).get("justification"),
             vex_detail=vex_map.get(v["cve_id"], {}).get("vex_detail"),
             exploitability_tier=vex_map.get(v["cve_id"], {}).get("exploitability_tier"),
+            analysis_model=vex_map.get(v["cve_id"], {}).get("analysis_model"),
         )
         for v in raw_vulns
     ]
@@ -588,7 +589,17 @@ async def cancel_vex(job_id: str) -> dict:
 
 @router.post("/{job_id}/retry-vex/{cve_id}", status_code=202)
 async def retry_vex_single(
-    job_id: str, cve_id: str, background_tasks: BackgroundTasks
+    job_id: str,
+    cve_id: str,
+    background_tasks: BackgroundTasks,
+    model: Optional[str] = Query(
+        None,
+        description=(
+            "분석에 사용할 Gemini 모델.  ``gemini-3-pro-preview`` / "
+            "``gemini-3-flash-preview`` 등 실제 모델명 지정 시 **해당 모델 "
+            "고정** (폴백 없음).  생략 시 기본 정책 (Pro → Flash 자동 폴백)."
+        ),
+    ),
 ) -> dict:
     """
     특정 CVE에 대해서만 VEX 분석을 (재)실행합니다.
@@ -619,9 +630,14 @@ async def retry_vex_single(
     if MOCK:
         background_tasks.add_task(run_mock_pipeline, job_id)
     else:
-        background_tasks.add_task(run_vex_single, job_id, cve_id)
+        background_tasks.add_task(run_vex_single, job_id, cve_id, model)
 
-    return {"job_id": job_id, "cve_id": cve_id, "status": "vex_analyzing"}
+    return {
+        "job_id": job_id,
+        "cve_id": cve_id,
+        "status": "vex_analyzing",
+        "model": model,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +890,7 @@ def _load_vex(
                         "justification": stmt.get("justification"),
                         "vex_detail": stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
                         "exploitability_tier": _vex_tier_from_stmt(stmt),
+                        "analysis_model": stmt.get("x_firmcore_analysis_model"),
                     }
             return vex_doc, vex_map
         except Exception:
@@ -904,6 +921,7 @@ def _load_vex(
                             "justification": stmt.get("justification"),
                             "vex_detail": report_text or stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
                             "exploitability_tier": _vex_tier_from_stmt(stmt),
+                            "analysis_model": stmt.get("x_firmcore_analysis_model"),
                         }
                 except Exception:
                     continue

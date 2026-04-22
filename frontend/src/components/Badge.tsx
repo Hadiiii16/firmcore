@@ -115,3 +115,28 @@ export function VexBadge({
     </span>
   )
 }
+
+// ── ModelBadge ───────────────────────────────────────────────────────────────
+// "이 CVE 판정을 어느 Gemini 모델이 냈는지" 를 시각적으로 구분.  Pro 쿼터
+// 소진 시 Flash 로 자동 폴백된 결과는 FLASH 배지가 뜨므로 사용자가 Pro
+// 로 재분석할지 선택할 수 있다.
+
+export function ModelBadge({ model }: { model: string | null | undefined }) {
+  if (!model) return null
+  const isPro = model.includes('pro')
+  const isFlash = model.includes('flash')
+  const label = isPro ? 'PRO' : isFlash ? 'FLASH' : 'AUTO'
+  const cls = isPro
+    ? 'bg-purple-900/50 text-purple-300 border border-purple-700/40'
+    : isFlash
+    ? 'bg-cyan-900/40 text-cyan-300 border border-cyan-700/40'
+    : 'bg-surface-700 text-gray-400 border border-surface-500'
+  return (
+    <span
+      className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold tracking-wider ${cls}`}
+      title={`분석에 사용된 모델: ${model}`}
+    >
+      {label}
+    </span>
+  )
+}

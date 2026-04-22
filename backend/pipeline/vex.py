@@ -412,6 +412,12 @@ class VexStatement:
     # ``standard`` — default for affected
     # ``None``  — status != affected (not_affected / fixed / under_investigation)
     exploitability_tier: Optional[str] = None
+    # 이 CVE 를 실제 분석하는 데 사용된 Gemini 모델명.  Pro 쿼터 소진
+    # 시 Flash 로 자동 폴백되는 경우가 있어 배치 시작 시 지정한 모델과
+    # 다를 수 있다.  UI 에서 "이 판정은 어느 모델의 분석 결과인지"
+    # 보여주고, 원하면 사용자가 Pro 로 재분석(Re-analyze Pro) 할 수
+    # 있도록 정보를 남긴다.
+    analysis_model: Optional[str] = None
 
 
 @dataclass
@@ -698,6 +704,7 @@ def _extract_statement_from_vex(
             impact_statement=impact,
             analysis_turns=turns_used,
             exploitability_tier=_extract_tier(status, impact),
+            analysis_model=s.get("x_firmcore_analysis_model"),
         )
     return VexStatement(
         cve_id=cve_id,
@@ -1512,7 +1519,23 @@ async def stream_gemini_yolo(
                 # of that leaks regardless of pyte text-extraction edge
                 # cases.
                 if initial_submitted and pre_submit_suppress[0]:
+                    # 해제 신호 확장 — Flash 는 ``✦`` 코멘트로 시작
+                    # 하지만 Pro(gemini-3-pro-preview) 는 ``✦`` 를 **전혀
+                    # 쓰지 않고** 바로 Shell 도구 박스나 Thinking 스피너
+                    # 로 들어간다.  ``✦`` 만 기다리면 수 분 분량의 실제
+                    # 작업 출력이 그대로 drop 되어 UI 에는 heartbeat 만
+                    # 보인다.  아래 중 하나라도 viewport 에 나타나면 해제:
+                    release_reason: Optional[str] = None
                     if "✦" in viewport_now:
+                        release_reason = "sparkle"
+                    elif "╭" in viewport_now:
+                        release_reason = "tool-box"
+                    elif "Thinking" in viewport_now:
+                        release_reason = "thinking"
+                    elif time.monotonic() - started_at >= 25.0:
+                        # 모든 신호 miss 시 안전망 — 25초 지나면 무조건 해제.
+                        release_reason = "fallback-25s"
+                    if release_reason is not None:
                         pre_submit_suppress[0] = False
                         # Skip everything that scrolled out of the
                         # viewport while we were in suppress mode.
@@ -1534,8 +1557,8 @@ async def stream_gemini_yolo(
                             emitted_order.append(_row)
                             emitted_hashes.add(_row)
                         logger.info(
-                            "[VEX] %s response stream detected; emit gate opened",
-                            cve_id,
+                            "[VEX] %s response stream detected (%s); emit gate opened",
+                            cve_id, release_reason,
                         )
 
                 # Keep a raw-decoded copy for OpenVEX JSON detection.
@@ -1732,6 +1755,7 @@ async def run_vex_analysis_loop(
     product_info: dict,
     output_dir: Path,
     vuln_info: Optional[dict] = None,
+    model_override: Optional[str] = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Analyze one CVE by delegating shell/tool execution to Gemini CLI itself.
@@ -1740,6 +1764,11 @@ async def run_vex_analysis_loop(
     run find/nm/readelf/strings/grep commands through its built-in Shell tool.
     The backend streams stdout/stderr as stage_progress events, then parses the
     final OpenVEX JSON from the accumulated response.
+
+    ``model_override`` 가 주어지면 그 모델을 고정적으로 사용한다 (사용자가
+    "Re-analyze (Pro)" 같은 명시 요청을 한 경우).  ``None`` 이면 기본
+    ``GEMINI_MODELS[0]`` 로 시도하고, 그게 Pro 계열인데 rate-limit 에
+    걸리면 자동으로 Flash 계열로 **배치를 중단하지 않고** 폴백한다.
 
     Yields
     ------
@@ -1780,29 +1809,74 @@ async def run_vex_analysis_loop(
     }
 
     response: Optional[str] = None
-    # Pro 모델 고정 사용.  rate-limit 에 걸리면 자동 재시도/폴백하지 않고
-    # rate_limited 이벤트를 emit 한 뒤 즉시 중단한다.  사용자가 /resume-vex
-    # 로 수동 재개하는 구조(run_vex_resume) 로 연결된다.
-    model = GEMINI_MODELS[0]
-    yield {
-        "type": "stage_progress",
-        "stage": "vex_analyzing",
-        "log": f"[{cve_id}] Gemini model attempt: {model}",
-    }
-    try:
-        async for event in stream_gemini_yolo(prompt, rootfs_path, cve_id, model):
-            if event.get("type") == "_gemini_response":
-                response = event["response"]
-            else:
-                yield event
-    except Exception as exc:
-        msg = str(exc)
+    # 폴백 체인 결정
+    #   - model_override 가 명시되면 그 모델만 시도 (사용자 의도 존중)
+    #   - 기본(override=None) 이고 Pro 계열이면 rate-limit 시 Flash 로
+    #     자동 폴백 → 배치 중단 없이 계속 진행
+    #   - 기본이 Flash 나 auto 면 체인 없이 단일 시도
+    primary = model_override or GEMINI_MODELS[0]
+    if model_override is None and primary == "gemini-3-pro-preview":
+        model_chain = [primary, "gemini-3-flash-preview"]
+    else:
+        model_chain = [primary]
+
+    used_model: Optional[str] = None
+    final_exception: Optional[Exception] = None
+    for attempt_idx, model in enumerate(model_chain):
+        yield {
+            "type": "stage_progress",
+            "stage": "vex_analyzing",
+            "log": (
+                f"[{cve_id}] Gemini model attempt: {model}"
+                + (f" (fallback from {model_chain[attempt_idx - 1]})" if attempt_idx > 0 else "")
+            ),
+        }
+        try:
+            response = None
+            async for event in stream_gemini_yolo(prompt, rootfs_path, cve_id, model):
+                if event.get("type") == "_gemini_response":
+                    response = event["response"]
+                else:
+                    yield event
+            # 여기에 도달 = stream 이 예외 없이 끝남 → 이 모델을 사용
+            used_model = model
+            final_exception = None
+            break
+        except Exception as exc:
+            msg = str(exc)
+            final_exception = exc
+            is_rate_limit = "[RATE_LIMIT]" in msg
+            # 다음 폴백이 남아있는 rate-limit 이면 조용히 다음 모델로 넘어감
+            if is_rate_limit and attempt_idx < len(model_chain) - 1:
+                next_model = model_chain[attempt_idx + 1]
+                yield {
+                    "type": "stage_progress",
+                    "stage": "vex_analyzing",
+                    "log": f"[{cve_id}] {model} 쿼터 소진 → {next_model} 로 폴백",
+                }
+                logger.info(
+                    "[VEX] %s %s rate-limit → fallback to %s",
+                    cve_id, model, next_model,
+                )
+                # staging 파일이 있을 수 있으니 지우고 다음 시도
+                for leftover in (vex_stage_path, report_stage_path):
+                    if leftover.exists():
+                        try:
+                            leftover.unlink()
+                        except OSError:
+                            pass
+                continue
+            # 폴백 여지 없거나 rate-limit 이 아닌 에러 — 상위로 전파
+            break
+
+    if final_exception is not None:
+        msg = str(final_exception)
         if "[RATE_LIMIT]" in msg:
             retry_after = _parse_retry_delay(msg)
             yield {
                 "type": "rate_limited",
                 "cve_id": cve_id,
-                "model": model,
+                "model": model_chain[-1],
                 "message": msg,
                 "retry_after": retry_after,
             }
@@ -1850,6 +1924,14 @@ async def run_vex_analysis_loop(
         vex_doc = _build_fallback_vex(cve_id, product_info)
 
     statement = _extract_statement_from_vex(cve_id, vex_doc, 1)
+    # 실제로 사용된 모델을 statement 에 기록.  fallback 체인으로 Flash 로
+    # 넘어간 경우 여기서 used_model == "gemini-3-flash-preview" 이고 UI
+    # 에는 Flash 뱃지가 뜬다.
+    if used_model:
+        statement.analysis_model = used_model
+        # vex_doc 에도 확장 필드로 써두면 재시작/복구 시 유지된다.
+        if vex_doc.get("statements"):
+            vex_doc["statements"][0]["x_firmcore_analysis_model"] = used_model
 
     # ── Report: prefer Gemini's WriteFile staging, else extract ──────────
     report_text = ""
@@ -1927,6 +2009,7 @@ async def analyze_cve_batch(
     product_info: dict,
     output_dir: Path,
     vuln_map: Optional[dict[str, dict]] = None,
+    model_override: Optional[str] = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     CVE 목록을 순차 처리하는 배치 분석기.
@@ -1978,6 +2061,7 @@ async def analyze_cve_batch(
             product_info=product_info,
             output_dir=vex_dir,
             vuln_info=(vuln_map or {}).get(cve_id),
+            model_override=model_override,
         ):
             yield event
             if event["type"] == "vex_complete":
@@ -2195,6 +2279,11 @@ def _build_combined_vex(
         # 표준 외 필드이므로 ``x_firmcore_`` 접두사를 붙인다.
         if s.exploitability_tier:
             stmt["x_firmcore_exploitability_tier"] = s.exploitability_tier
+        # 이 판정을 낸 Gemini 모델 이름.  Pro 쿼터 소진 시 Flash 로 자동
+        # 폴백되는 케이스가 있어 Pro vs Flash 구분 + 추후 재분석 UX 에
+        # 필요하다.
+        if s.analysis_model:
+            stmt["x_firmcore_analysis_model"] = s.analysis_model
         if s.report_text:
             stmt["x_firmcore_report"] = s.report_text
         openvex_stmts.append(stmt)
@@ -2258,6 +2347,7 @@ def rebuild_combined_vex_from_dir(
                     analysis_turns=stmt_dict.get("x_firmcore_turns", 0),
                     report_text=report_text,
                     exploitability_tier=tier,
+                    analysis_model=stmt_dict.get("x_firmcore_analysis_model"),
                 )
                 statements.append(stmt)
         except Exception as exc:

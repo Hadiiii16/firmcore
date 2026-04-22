@@ -304,10 +304,16 @@ async def run_vex_resume_from(job_id: str, start_cve_id: str) -> None:
                      cve_override=targets)
 
 
-async def run_vex_single(job_id: str, cve_id: str) -> None:
+async def run_vex_single(
+    job_id: str, cve_id: str, model: Optional[str] = None,
+) -> None:
     """
     단일 CVE에 대해서만 VEX 분석을 실행합니다.
     완료 후 combined_vex.json을 전체 재빌드합니다.
+
+    ``model`` 이 지정되면 해당 모델로 **고정** 분석 (폴백 없음).  사용자가
+    UI 에서 "Re-analyze (Pro)" / "Re-analyze (Flash)" 처럼 명시 선택할 때
+    사용.
     """
     logger.info("[Runner] 단일 CVE VEX 분석: job=%s cve=%s", job_id, cve_id)
 
@@ -376,7 +382,7 @@ async def run_vex_single(job_id: str, cve_id: str) -> None:
     )
 
     await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir,
-                     cve_override=[cve_id])
+                     cve_override=[cve_id], model_override=model)
 
     # 완료 후 combined_vex.json 전체 재빌드 (기존 완료 CVE 포함)
     vex_dir = storage_dir / "vex"
@@ -568,6 +574,7 @@ async def _stage_vex(
     product_info: dict,
     storage_dir: Path,
     cve_override: Optional[list[str]] = None,
+    model_override: Optional[str] = None,
 ) -> None:
     stage = "vex_analyzing"
     t0 = time.monotonic()
@@ -620,6 +627,7 @@ async def _stage_vex(
             product_info=product_info,
             output_dir=storage_dir,
             vuln_map=vuln_info_map,
+            model_override=model_override,
         ):
             event_type = event.get("type", "")
 
@@ -687,6 +695,9 @@ async def _stage_vex(
                         ),
                         "exploitability_tier": (
                             stmt.exploitability_tier if stmt else None
+                        ),
+                        "analysis_model": (
+                            stmt.analysis_model if stmt else None
                         ),
                     }
                 await _emit_event(job_id, emit_event)

@@ -111,8 +111,10 @@ export function cancelVex(
 export function retryVexSingle(
   jobId: string,
   cveId: string,
+  model?: string,
 ): Promise<{ job_id: string; cve_id: string; status: string }> {
-  return request(`/jobs/${jobId}/retry-vex/${encodeURIComponent(cveId)}`, { method: 'POST' })
+  const qs = model ? `?model=${encodeURIComponent(model)}` : ''
+  return request(`/jobs/${jobId}/retry-vex/${encodeURIComponent(cveId)}${qs}`, { method: 'POST' })
 }
 
 // ── SSE Stream ────────────────────────────────────────────────────────────────

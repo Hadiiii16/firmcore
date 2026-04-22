@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { ShieldAlert, Search, ChevronDown, ChevronUp } from 'lucide-react'
-import { SeverityBadge, VexBadge } from '../../components/Badge'
+import { SeverityBadge, VexBadge, ModelBadge } from '../../components/Badge'
 import type { CveResult } from '../../types'
 
 const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NEGLIGIBLE', 'UNKNOWN']
@@ -72,7 +72,10 @@ function CveRow({ cve }: { cve: CveResult }) {
           {fmtNum(cve.risk_score, 1)}
         </td>
         <td className="px-3 py-3">
-          <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
+          <div className="flex items-center gap-1.5">
+            <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
+            <ModelBadge model={cve.analysis_model} />
+          </div>
         </td>
         <td className="px-3 py-3 text-gray-600">
           {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}

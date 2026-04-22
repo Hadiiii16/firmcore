@@ -103,6 +103,12 @@ class CveResult(BaseModel):
     #   "standard"  — 일반 affected (시급 패치 대상)
     #   None        — status != "affected" (tier 의미 없음)
     exploitability_tier: Optional[str] = None
+    # 이 CVE 판정을 실제로 낸 Gemini 모델명.  Pro 쿼터 소진 시 Flash 로
+    # 자동 폴백된 케이스가 있어 배치 기본 모델과 다를 수 있다.
+    # 프론트엔드는 이 값을 뱃지(``PRO``/``FLASH``)로 표시하고,
+    # Flash 로 분석된 CVE 를 Pro 로 재분석하도록 Re-analyze(Pro) 버튼을
+    # 활성화한다.  ``null`` = 모델 추적 전 데이터 또는 mock.
+    analysis_model: Optional[str] = None
 
 
 class SbomComponent(BaseModel):

@@ -187,14 +187,17 @@ export function useJobDetail(jobId: string) {
     }
   }, [jobId])
 
-  const handleRetryVexSingle = useCallback(async (cveId: string) => {
+  const handleRetryVexSingle = useCallback(async (cveId: string, model?: string) => {
     setState((s) => ({ ...s, retryingCve: cveId }))
     try {
-      await retryVexSingle(jobId, cveId)
+      await retryVexSingle(jobId, cveId, model)
       // 개별 재분석은 **로그를 비우지 않고** 기존 기록에 구분자 + 시작
       // 표시만 덧붙인다.  handleRetryVex (전체 재분석) 은 의미상 "처음
       // 부터" 이므로 clear 하지만, 단일 CVE 재분석은 기존 로그 맥락
       // 위에 덧붙는 게 자연스럽다.
+      const modelLabel = model
+        ? (model.includes('pro') ? 'Pro' : model.includes('flash') ? 'Flash' : model)
+        : 'default'
       setState((s) => ({
         ...s,
         retryingCve: null,
@@ -208,7 +211,7 @@ export function useJobDetail(jobId: string) {
           {
             id: ++logIdRef.current,
             stage: 'system',
-            text: `────── ${cveId} 개별 재분석 시작 ──────`,
+            text: `────── ${cveId} 개별 재분석 시작 (${modelLabel}) ──────`,
           },
         ],
       }))

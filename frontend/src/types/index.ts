@@ -92,6 +92,10 @@ export interface CveResult {
   //   'standard' — default affected (urgent patch).
   //   null       — tier is only meaningful for affected statuses.
   exploitability_tier: 'low' | 'standard' | null
+  // Actual Gemini model that produced this VEX verdict.  May differ from
+  // the batch default when Pro 쿼터 소진 → Flash auto-fallback.  Null for
+  // legacy records analysed before tracking was added.
+  analysis_model: string | null
 }
 
 // ── Dashboard aggregation ────────────────────────────────────────────────────

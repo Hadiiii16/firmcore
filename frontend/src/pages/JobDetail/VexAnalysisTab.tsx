@@ -1,11 +1,13 @@
 import { useMemo, useState, type MouseEvent } from 'react'
-import { RefreshCw, Bot, ChevronDown, ChevronRight, FastForward } from 'lucide-react'
-import { SeverityBadge, VexBadge } from '../../components/Badge'
+import { RefreshCw, Bot, ChevronDown, ChevronRight, FastForward, Zap, Gem } from 'lucide-react'
+import { SeverityBadge, VexBadge, ModelBadge } from '../../components/Badge'
 import type { CveResult, JobStatus } from '../../types'
 
 interface VexAnalysisTabProps {
   cves: CveResult[]
-  onRetryVexSingle: (cveId: string) => Promise<void>
+  // ``model`` 옵션으로 Gemini 모델 명시 선택 (Pro/Flash).  미지정 시
+  // 기본 정책(Pro → Flash 자동 폴백) 으로 백엔드에서 처리.
+  onRetryVexSingle: (cveId: string, model?: string) => Promise<void>
   onResumeVexFrom: (cveId: string) => Promise<void>
   retryingCve: string | null
   resumingFromCve: string | null
@@ -126,19 +128,36 @@ export function VexAnalysisTab({
     { key: 'unknown',             label: 'UNANALYZED',  count: stats.unknown,            active: 'bg-surface-700 text-gray-100 border-surface-500',  inactive: 'bg-surface-800/60 text-gray-500 border-surface-700 hover:bg-surface-700/60' },
   ]
 
-  function RetryButton({ cveId }: { cveId: string }) {
+  // Re-analyze 는 Pro/Flash 2가지 모델 선택 가능한 분리 버튼.
+  // - Pro 버튼 : 품질 우선, 쿼터 많이 씀.  Flash 로 분석된 CVE 를
+  //              Pro 로 업그레이드할 때 주로 사용.
+  // - Flash 버튼 : 빠르고 쿼터 절약.  간단한 판정을 빠르게 재확인할 때.
+  function RetryButtonGroup({ cveId }: { cveId: string }) {
     const isThis = retryingCve === cveId
     const isBusy = retryingCve !== null || resumingFromCve !== null
+    const baseCls =
+      'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono bg-surface-800 text-gray-500 border disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0'
     return (
-      <button
-        onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId) }}
-        disabled={isBusy || !canRetry}
-        title={canRetry ? `${cveId} VEX 분석 재실행` : '분석 완료 후 사용 가능'}
-        className="flex items-center gap-1 px-2 py-1 rounded text-xs font-mono bg-surface-800 text-gray-500 border border-surface-600 hover:bg-cyan-900/40 hover:text-accent-cyan hover:border-cyan-700/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
-      >
-        <RefreshCw size={11} className={isThis ? 'animate-spin' : ''} />
-        {isThis ? 'Analyzing…' : 'Re-analyze'}
-      </button>
+      <div className="flex items-center gap-1 shrink-0">
+        <button
+          onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId, 'gemini-3-pro-preview') }}
+          disabled={isBusy || !canRetry}
+          title={canRetry ? `${cveId} 를 Pro 모델로 재분석 (품질 우선, 쿼터 많이 씀)` : '분석 완료 후 사용 가능'}
+          className={`${baseCls} border-surface-600 hover:bg-purple-900/40 hover:text-purple-300 hover:border-purple-700/50`}
+        >
+          <Gem size={11} className={isThis ? 'animate-pulse' : ''} />
+          {isThis ? '…' : 'Pro'}
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId, 'gemini-3-flash-preview') }}
+          disabled={isBusy || !canRetry}
+          title={canRetry ? `${cveId} 를 Flash 모델로 재분석 (빠름, 쿼터 절약)` : '분석 완료 후 사용 가능'}
+          className={`${baseCls} border-surface-600 hover:bg-cyan-900/40 hover:text-cyan-300 hover:border-cyan-700/50`}
+        >
+          <Zap size={11} className={isThis ? 'animate-pulse' : ''} />
+          {isThis ? '…' : 'Flash'}
+        </button>
+      </div>
     )
   }
 
@@ -241,8 +260,9 @@ export function VexAnalysisTab({
                   {cve.package_name} {cve.package_version}
                 </span>
                 <div className="ml-auto flex items-center gap-2 shrink-0">
+                  <ModelBadge model={cve.analysis_model} />
                   <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
-                  <RetryButton cveId={cve.cve_id} />
+                  <RetryButtonGroup cveId={cve.cve_id} />
                   <ResumeFromButton cveId={cve.cve_id} />
                 </div>
               </button>
@@ -293,7 +313,7 @@ export function VexAnalysisTab({
                 <SeverityBadge severity={cve.severity} />
                 <span className="font-mono text-sm text-gray-400">{cve.cve_id}</span>
                 <span className="text-xs text-gray-600 font-mono flex-1">{cve.package_name}</span>
-                <RetryButton cveId={cve.cve_id} />
+                <RetryButtonGroup cveId={cve.cve_id} />
                 <ResumeFromButton cveId={cve.cve_id} />
               </li>
             ))}
