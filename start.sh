@@ -148,6 +148,10 @@ start_backend() {
     "STORAGE_DIR=$SCRIPT_DIR/storage"
     "PATH=$PATH"
     "HOME=$HOME"
+    # Codex CLI 가 OAuth 토큰을 읽는 경로.  명시해 두지 않으면 백엔드
+    # subprocess 환경에서 ``HOME`` 이 누락되는 극단적 케이스에서 Codex 가
+    # ``~/.codex/auth.json`` 을 못 찾아 인증 실패로 떨어진다.
+    "CODEX_HOME=${CODEX_HOME:-$HOME/.codex}"
   )
 
   if [[ -n "${GEMINI_API_KEY:-}" ]]; then
@@ -230,14 +234,13 @@ start_frontend() {
 _CLEANUP_DONE=false
 
 kill_gemini_procs() {
-  # gemini 프로세스와 그 프로세스 그룹 전체를 종료
-  # pgrep으로 PID 목록 수집 후 각각의 pgid로 kill
+  # VEX 분석 CLI(Gemini / OpenAI Codex) 프로세스와 그 프로세스 그룹 전체를 종료.
+  # 두 CLI 모두 os.setsid 로 새 세션을 만들기 때문에 pgid 기반 kill 이 필요.
   local pids
-  pids=$(pgrep -f "bin/gemini" 2>/dev/null || true)
+  pids=$(pgrep -f "bin/gemini|bin/codex" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
-    warn "잔여 Gemini 프로세스 종료: $(echo "$pids" | tr '\n' ' ')"
+    warn "잔여 VEX CLI 프로세스 종료: $(echo "$pids" | tr '\n' ' ')"
     while IFS= read -r pid; do
-      # 프로세스 그룹 전체 종료 (gemini가 setsid로 새 세션 생성하므로 pgid 필요)
       local pgid
       pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
       if [[ -n "$pgid" && "$pgid" != "0" ]]; then

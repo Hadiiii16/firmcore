@@ -68,7 +68,45 @@ GET /api/jobs/{id}/stream  ←  DB 폴링 (after_id 기반 중복 방지)  ←  
 
 이벤트 본문은 항상 `job_events` DB 테이블이 source of truth입니다. `event_bus` 큐는 **크기 1 의 "깨우기 신호"** 만 전달합니다 — 이미 쌓인 신호가 있으면 `put_nowait` 가 조용히 drop 하고, SSE 제너레이터는 신호 하나로 `db_get_events(after_id=N)` 로 누적 이벤트를 batch 로 읽어옵니다. 큰 큐는 불필요하고 노이즈만 늘립니다.
 
-### VEX 분석 엔진 (`backend/pipeline/vex.py`)
+### VEX 분석 엔진 (`backend/pipeline/vex.py` + `backend/pipeline/cli/`)
+
+두 CLI 엔진을 동일한 async-generator 인터페이스로 래핑해 attempt chain 으로
+폴백합니다.
+
+- **Gemini CLI** (`backend/pipeline/vex.py` 의 `stream_gemini_yolo`) — `--yolo`
+  + `cwd=rootfs_path` 로 PTY 실행. Ink 박스 출력을 pyte 로 렌더하고 Chrome
+  필터/Shell 박스 변환/WriteFile staging 규약 등 복잡한 레이어가 필요합니다
+  (아래 상세).
+- **OpenAI Codex CLI** (`backend/pipeline/cli/codex.py` 의 `stream_codex_exec`) —
+  `codex exec --json` 으로 JSONL 네이티브 스트리밍. PTY·pyte 없이 line-by-line
+  파싱. `--output-schema backend/pipeline/openvex_schema.json` 로 최종 응답이
+  OpenVEX JSON 이 되도록 강제하고 `--output-last-message` 로 파일에 받아
+  파싱합니다. 샌드박스는 `-s read-only -a never` 로 rootfs 쓰기 불가 →
+  보고서(Markdown) 는 JSON 의 `statements[0].x_firmcore_report_md` 확장
+  필드에 임베드 후 백엔드가 분리 저장. WriteFile staging 규약 불필요.
+
+**폴백 체인 (auto 모드)** — `.env` 의 `GEMINI_MODEL=gemini-3-pro-preview` 기본값
+으로 잡이 시작되면 [backend/pipeline/cli/base.py](backend/pipeline/cli/base.py)
+의 `DEFAULT_AUTO_CHAIN` 이 적용됩니다:
+
+```
+Gemini Pro → OpenAI Codex (gpt-5-codex) → Gemini Flash
+```
+
+각 attempt 는 `RateLimitError` 또는 기존 레거시의 `[RATE_LIMIT]` 마커로 분기:
+쿼터 소진이면 조용히 다음 spec 으로 넘어가고, 일반 에러면 즉시 상위로 전파.
+명시 모델 override (retry-vex/{cve}?model=...) 시에는 단일 attempt — `gpt-*`/
+`o3*`/`codex-*`/`chatgpt-*` prefix 면 Codex adapter, `gemini-*` 면 Gemini adapter
+로 라우팅 ([resolve_engine_for_model](backend/pipeline/cli/base.py)).
+
+`statement.analysis_model` 에는 **실제로 응답한 엔진:모델** 이 기록되고,
+combined_vex.json 재빌드 시 `x_firmcore_analysis_model` 로 영속화됩니다.
+프론트엔드 `ModelBadge` 는 이 값 prefix 로 PRO / CODEX / FLASH / AUTO 배지를
+구분합니다.
+
+---
+
+**Gemini 쪽 상세 구현 (레거시 PTY 경로)**
 
 Gemini CLI를 `--yolo` + `cwd=rootfs_path`로 **PTY(pseudo-terminal) 방식**으로 실행합니다. `--output-format` 플래그 없이 일반 텍스트 출력으로 동작하며 수동 실행과 완전히 동일하게 동작합니다.
 
@@ -262,7 +300,15 @@ Resume from here 의 삭제 대상 CVE 가 화면과 어긋나지 않으려면 *
 |------|--------|------|
 | `MOCK_PIPELINE` | `false` | 전체 파이프라인 더미 데이터로 시뮬레이션 |
 | `FIRMCORE_RELOAD` | `0` | `1` 이면 `./start.sh` 가 uvicorn `--reload` 포함 실행 (개발용). 분석 중 코드 수정은 분석을 끊어먹으니 평상시 꺼둔다 |
-| `GEMINI_MODEL` / `GEMINI_MODELS` | `auto` | Gemini 모델. `auto`/`default` 면 `--model` 인자 생략 → CLI default(Pro) → 쿼터 소진 시 Flash 자동 폴백 |
+| `GEMINI_MODEL` / `GEMINI_MODELS` | `gemini-3-pro-preview` | Gemini 기본 모델. 이 값이 Pro 계열이면 auto 폴백 체인 `Pro → Codex → Flash` 적용. `auto`/`default` 면 `--model` 인자 생략 |
+| `CODEX_MODEL` | `codex-default` | Codex 어댑터의 기본 모델 sentinel. **ChatGPT OAuth 계정은 `-m gpt-5-codex` 같은 명시 모델명을 거부**(400 `invalid_request_error`) 하므로 기본값은 `-m` 플래그를 생략시키는 sentinel. API key 로 직접 호출하는 환경에서는 `CODEX_MODEL=gpt-5-codex` 같이 override 가능 |
+| `CODEX_BIN` | `codex` | Codex CLI 실행 파일 이름/경로 |
+| `VEX_CODEX_TIMEOUT` | `VEX_GEMINI_TIMEOUT` 값(1800) | CVE 하나당 Codex CLI wall-clock 타임아웃 (초) |
+| `VEX_CODEX_IDLE_SHUTDOWN` | `180` | Codex stdout 이 이 시간 동안 한 줄도 안 오면 hang 으로 간주하고 SIGKILL |
+| `VEX_CODEX_LOG_REASONING` | `0` | `1` 이면 Codex 의 reasoning item 도 로그로 방출 (verbose) |
+| `VEX_CODEX_LOG_STDERR` | `1` | 실패 시 Codex stderr 끝부분을 stage_progress 로 노출 |
+| `CODEX_REASONING_EFFORT` | (비움 → `~/.codex/config.toml` 상속, 보통 medium) | 허용: `minimal` / `low` / `medium` / `high` / `xhigh`. 설정 시 `-c model_reasoning_effort=<value>` 로 주입해 per-job 오버라이드. `high` 이상은 응답 시간 · 쿼터 사용이 대폭 증가하므로 중요 CVE 만 고려 |
+| `CODEX_REASONING_SUMMARY` | (비움 → config.toml 상속) | 허용: `auto` / `concise` / `detailed` / `none`. `detailed` 면 Codex 가 사고 과정 요약을 더 자주 방출해 로그가 verbose |
 | `VEX_GEMINI_TIMEOUT` | `1800` | CVE 하나당 Gemini CLI 타임아웃 (초, 30분) |
 | `VEX_GEMINI_IDLE_SHUTDOWN` | `45` | PTY 출력이 시작된 뒤 idle 지속 시 강제 종료 임계치 (초) |
 | `VEX_PTY_COLUMNS` / `VEX_PTY_LINES` | `200` / `80` | PTY/pyte viewport 크기. 200 cols 는 긴 grep 결과가 Shell 박스 안에서 wrap 되지 않도록 충분한 폭 |
@@ -283,8 +329,14 @@ Resume from here 의 삭제 대상 CVE 가 화면과 어긋나지 않으려면 *
 - **binwalk** — 펌웨어 추출
 - **grype** — CVE 스캔
 - **Gemini CLI** v0.38.2+ (`npm install -g @google/gemini-cli`) — Google 계정 OAuth 로 인증 (`gemini` 한 번 실행해 로그인)
+- **OpenAI Codex CLI** v0.122+ (`npm install -g @openai/codex` 또는 공식 설치 방법) — ChatGPT Pro/Plus OAuth 로 인증 (`codex login` 한 번). Auto 폴백 체인의 중간 단계이므로 필수.
 - **sbom_claude_scripts** — 프로젝트 루트에 바이너리 배치
 - **`~/.gemini/GEMINI.md`** (v4.0) — Gemini VEX 분석 시스템 프롬프트. Attack-Surface + Mitigation 4단계 모델, exploitability_tier 부여 규칙, WriteFile 경로 규약 등 포함. gemini CLI 가 어느 디렉토리에서 실행되든 자동 로드됩니다.
+- **`~/.codex/AGENTS.md`** — Codex 용 시스템 프롬프트. GEMINI.md 와 **내용 자체는 거의 동일** 해도 무방합니다 — Codex 어댑터가 프롬프트 끝에 "WriteFile 금지 / 최종 응답은 OpenVEX JSON" override 를 자동 주입하므로 GEMINI.md 의 WriteFile 섹션을 굳이 삭제할 필요는 없습니다. 간단한 배치:
+  ```bash
+  cp ~/.gemini/GEMINI.md ~/.codex/AGENTS.md
+  ```
+  Codex 가 cwd 상위로 walk 해가며 `AGENTS.md` 를 찾아 로드합니다. 프로젝트별로 다르게 쓰고 싶다면 프로젝트 루트에 `AGENTS.md` 를 둬도 동일하게 인식됩니다.
 
 ## 주의사항
 

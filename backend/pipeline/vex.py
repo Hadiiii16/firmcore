@@ -57,6 +57,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
+from pipeline.cli import (
+    AttemptSpec,
+    RateLimitError,
+    build_default_attempt_chain,
+    resolve_engine_for_model,
+    GEMINI_PRO_MODEL,
+)
+from pipeline.cli.codex import stream_codex_exec
+
 logger = logging.getLogger(__name__)
 
 # Dedicated logger for raw Gemini PTY output — prints lines without the
@@ -1802,64 +1811,116 @@ async def run_vex_analysis_loop(
     prompt = _build_gemini_yolo_prompt(
         cve_id, product_info, vex_stage_rel, report_stage_rel, vuln_info
     )
+    # Codex 모드용 프롬프트 override.  WriteFile staging 규약을 무효화하고
+    # OpenVEX JSON 을 최종 응답으로 직접 반환하게 지시한다.  Codex 는
+    # ``--output-schema`` 로 응답 shape 이 강제되므로 이 지시가 스키마와
+    # 같은 방향이어야 함.
+    codex_prompt_override = (
+        "\n\n---\n"
+        "# CODEX 모드 전용 지시 (이 섹션이 위의 WriteFile 관련 지시보다 우선)\n\n"
+        "- 파일 쓰기 도구(WriteFile)나 Shell 의 ``tee``/``cat > ...`` 류를 사용하지 말 것.\n"
+        f"- 위 본문의 ``{vex_stage_rel}`` / ``{report_stage_rel}`` staging 경로는 무시한다.\n"
+        "- 최종 응답(마지막 메시지) 은 **OpenVEX JSON 한 객체만** 이어야 한다.  응답 문자열\n"
+        "  전체가 곧 유효한 JSON — 앞뒤에 Markdown 이나 설명을 붙이지 않는다.\n"
+        "- 한국어 분석 보고서(Markdown) 는 ``statements[0].x_firmcore_report_md`` 필드에\n"
+        "  문자열로 임베드한다. 백엔드가 이 필드를 꺼내 ``{CVE-ID}_report.md`` 로 저장한다.\n"
+    )
+
+    # ── 폴백 체인(AttemptSpec) 결정 ────────────────────────────────────
+    #   - model_override 가 명시되면 그 모델만 단일 attempt.  엔진은
+    #     모델 prefix 로 추정 (gemini-* / gpt-* / o3*).
+    #   - 기본(override=None) 이고 primary 가 Gemini Pro 이면 3단계 auto
+    #     체인: Gemini Pro → Codex → Gemini Flash.  쿼터가 나갈 때마다
+    #     다음 spec 으로 배치 중단 없이 폴백.
+    #   - 그 외(기본이 Flash 나 auto 고정, 혹은 override 없지만 primary 가
+    #     Pro 가 아닌 경우) 는 단일 attempt 만.
+    primary = model_override or GEMINI_MODELS[0]
+    if model_override:
+        try:
+            eng = resolve_engine_for_model(model_override)
+        except ValueError:
+            eng = "gemini"
+        attempt_chain: list[AttemptSpec] = [AttemptSpec(eng, model_override)]
+    elif primary == GEMINI_PRO_MODEL:
+        attempt_chain = build_default_attempt_chain()
+    else:
+        attempt_chain = [AttemptSpec("gemini", primary)]
+
+    chain_label = " → ".join(f"{s.engine}:{s.model}" for s in attempt_chain)
     yield {
         "type": "stage_progress",
         "stage": "vex_analyzing",
-        "log": f"[{cve_id}] Gemini CLI --yolo analysis started (models: {', '.join(GEMINI_MODELS)})",
+        "log": f"[{cve_id}] VEX analysis started (chain: {chain_label})",
     }
 
-    response: Optional[str] = None
-    # 폴백 체인 결정
-    #   - model_override 가 명시되면 그 모델만 시도 (사용자 의도 존중)
-    #   - 기본(override=None) 이고 Pro 계열이면 rate-limit 시 Flash 로
-    #     자동 폴백 → 배치 중단 없이 계속 진행
-    #   - 기본이 Flash 나 auto 면 체인 없이 단일 시도
-    primary = model_override or GEMINI_MODELS[0]
-    if model_override is None and primary == "gemini-3-pro-preview":
-        model_chain = [primary, "gemini-3-flash-preview"]
-    else:
-        model_chain = [primary]
-
+    # attempt 루프 결과 담을 변수
+    response: Optional[str] = None              # Gemini 경로에서만 채워짐
+    codex_vex_doc: Optional[dict] = None        # Codex 경로 결과
+    codex_report_text: str = ""
+    used_engine: Optional[str] = None
     used_model: Optional[str] = None
     final_exception: Optional[Exception] = None
-    for attempt_idx, model in enumerate(model_chain):
+
+    for attempt_idx, spec in enumerate(attempt_chain):
+        fallback_suffix = (
+            f" (fallback from {attempt_chain[attempt_idx - 1].engine}:{attempt_chain[attempt_idx - 1].model})"
+            if attempt_idx > 0 else ""
+        )
         yield {
             "type": "stage_progress",
             "stage": "vex_analyzing",
             "log": (
-                f"[{cve_id}] Gemini model attempt: {model}"
-                + (f" (fallback from {model_chain[attempt_idx - 1]})" if attempt_idx > 0 else "")
+                f"[{cve_id}] attempt {attempt_idx+1}/{len(attempt_chain)}: "
+                f"{spec.engine}:{spec.model}{fallback_suffix}"
             ),
         }
         try:
-            response = None
-            async for event in stream_gemini_yolo(prompt, rootfs_path, cve_id, model):
-                if event.get("type") == "_gemini_response":
-                    response = event["response"]
-                else:
-                    yield event
-            # 여기에 도달 = stream 이 예외 없이 끝남 → 이 모델을 사용
-            used_model = model
+            if spec.engine == "gemini":
+                response = None
+                async for event in stream_gemini_yolo(prompt, rootfs_path, cve_id, spec.model):
+                    if event.get("type") == "_gemini_response":
+                        response = event["response"]
+                    else:
+                        yield event
+            else:  # codex
+                response = None
+                codex_vex_doc = None
+                codex_report_text = ""
+                codex_log_path = output_dir / f"{cve_id}_codex_jsonl.log"
+                async for event in stream_codex_exec(
+                    prompt=prompt + codex_prompt_override,
+                    rootfs_path=rootfs_path,
+                    cve_id=cve_id,
+                    model=spec.model,
+                    output_dir=output_dir,
+                    log_path=codex_log_path,
+                ):
+                    if event.get("type") == "_codex_result":
+                        codex_vex_doc = event.get("vex_doc")
+                        codex_report_text = event.get("report_text") or ""
+                    else:
+                        yield event
+            used_engine, used_model = spec.engine, spec.model
             final_exception = None
             break
         except Exception as exc:
             msg = str(exc)
             final_exception = exc
-            is_rate_limit = "[RATE_LIMIT]" in msg
-            # 다음 폴백이 남아있는 rate-limit 이면 조용히 다음 모델로 넘어감
-            if is_rate_limit and attempt_idx < len(model_chain) - 1:
-                next_model = model_chain[attempt_idx + 1]
+            is_rate_limit = isinstance(exc, RateLimitError) or ("[RATE_LIMIT]" in msg)
+            if is_rate_limit and attempt_idx < len(attempt_chain) - 1:
+                nxt = attempt_chain[attempt_idx + 1]
                 yield {
                     "type": "stage_progress",
                     "stage": "vex_analyzing",
-                    "log": f"[{cve_id}] {model} 쿼터 소진 → {next_model} 로 폴백",
+                    "log": f"[{cve_id}] {spec.engine}:{spec.model} 쿼터 소진 → {nxt.engine}:{nxt.model} 로 폴백",
                 }
                 logger.info(
-                    "[VEX] %s %s rate-limit → fallback to %s",
-                    cve_id, model, next_model,
+                    "[VEX] %s %s:%s rate-limit → fallback to %s:%s",
+                    cve_id, spec.engine, spec.model, nxt.engine, nxt.model,
                 )
-                # staging 파일이 있을 수 있으니 지우고 다음 시도
-                for leftover in (vex_stage_path, report_stage_path):
+                # staging / codex output 잔존 제거 후 다음 attempt
+                codex_last_path = output_dir / f"{cve_id}_codex_last.json"
+                for leftover in (vex_stage_path, report_stage_path, codex_last_path):
                     if leftover.exists():
                         try:
                             leftover.unlink()
@@ -1873,82 +1934,99 @@ async def run_vex_analysis_loop(
         msg = str(final_exception)
         if "[RATE_LIMIT]" in msg:
             retry_after = _parse_retry_delay(msg)
+            last_spec = attempt_chain[-1]
             yield {
                 "type": "rate_limited",
                 "cve_id": cve_id,
-                "model": model_chain[-1],
+                "model": last_spec.model,
+                "engine": last_spec.engine,
                 "message": msg,
                 "retry_after": retry_after,
             }
             return
-        yield {"type": "error", "message": f"Gemini CLI failed: {msg}"}
+        yield {"type": "error", "message": f"VEX analysis failed: {msg}"}
         return
 
-    if response is None:
-        yield {"type": "error", "message": "Gemini CLI finished without a response"}
-        return
-
-    # Clean PTY framing so the archived raw log stays human-readable.  The
-    # authoritative VEX/report artifacts now come from Gemini's WriteFile tool
-    # — parsing them out of the terminal stream is only a fallback.
-    cleaned_response = clean_gemini_response(response)
-
-    response_path = output_dir / f"{cve_id}_gemini_yolo.md"
-    response_path.write_text(
-        f"# {cve_id} Gemini CLI --yolo analysis\n\n{cleaned_response}",
-        encoding="utf-8",
-    )
-
-    # ── Primary path: read artifacts Gemini saved via WriteFile into the
-    # rootfs-relative staging files (workspace restriction workaround).
+    # ── vex_doc / report_text 결정 — 엔진별 분기 ─────────────────────
     vex_doc: Optional[dict] = None
-    if vex_stage_path.exists():
-        try:
-            vex_doc = json.loads(vex_stage_path.read_text(encoding="utf-8"))
-            logger.info("[VEX] %s OpenVEX loaded from WriteFile staging", cve_id)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(
-                "[VEX] %s WriteFile staging %s unreadable (%s); falling back to text extraction",
-                cve_id, vex_stage_path.name, exc,
-            )
-            vex_doc = None
+    report_text: str = ""
+    cleaned_response: str = ""
 
-    # ── Fallback: extract from the terminal stream ───────────────────────
-    if not vex_doc:
-        vex_doc = extract_json_from_response(cleaned_response)
-    if not vex_doc:
-        vex_doc = extract_json_from_response(response)
-    if not vex_doc:
-        logger.warning("[VEX] %s no OpenVEX JSON found; using fallback", cve_id)
-        yield {"type": "vex_json_not_found", "cve_id": cve_id}
-        vex_doc = _build_fallback_vex(cve_id, product_info)
+    if used_engine == "codex":
+        # Codex 는 --output-last-message 파일에서 파싱·분리해 sentinel
+        # 로 받았다.  JSON 추출 실패 시 Gemini 경로와 동일하게 fallback
+        # VEX 로 under_investigation 저장.
+        vex_doc = codex_vex_doc
+        report_text = codex_report_text
+        if not vex_doc:
+            logger.warning(
+                "[VEX] %s Codex 응답에서 OpenVEX JSON 을 추출 실패 — fallback 사용", cve_id,
+            )
+            yield {"type": "vex_json_not_found", "cve_id": cve_id}
+            vex_doc = _build_fallback_vex(cve_id, product_info)
+    else:
+        if response is None:
+            yield {"type": "error", "message": "Gemini CLI finished without a response"}
+            return
+
+        # Clean PTY framing so the archived raw log stays human-readable.  The
+        # authoritative VEX/report artifacts now come from Gemini's WriteFile tool
+        # — parsing them out of the terminal stream is only a fallback.
+        cleaned_response = clean_gemini_response(response)
+
+        response_path = output_dir / f"{cve_id}_gemini_yolo.md"
+        response_path.write_text(
+            f"# {cve_id} Gemini CLI --yolo analysis\n\n{cleaned_response}",
+            encoding="utf-8",
+        )
+
+        # ── Primary path: read artifacts Gemini saved via WriteFile into the
+        # rootfs-relative staging files (workspace restriction workaround).
+        if vex_stage_path.exists():
+            try:
+                vex_doc = json.loads(vex_stage_path.read_text(encoding="utf-8"))
+                logger.info("[VEX] %s OpenVEX loaded from WriteFile staging", cve_id)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "[VEX] %s WriteFile staging %s unreadable (%s); falling back to text extraction",
+                    cve_id, vex_stage_path.name, exc,
+                )
+                vex_doc = None
+
+        # ── Fallback: extract from the terminal stream ───────────────────
+        if not vex_doc:
+            vex_doc = extract_json_from_response(cleaned_response)
+        if not vex_doc:
+            vex_doc = extract_json_from_response(response)
+        if not vex_doc:
+            logger.warning("[VEX] %s no OpenVEX JSON found; using fallback", cve_id)
+            yield {"type": "vex_json_not_found", "cve_id": cve_id}
+            vex_doc = _build_fallback_vex(cve_id, product_info)
+
+        # ── Report: prefer Gemini's WriteFile staging, else extract ──────
+        if report_stage_path.exists():
+            try:
+                disk_text = report_stage_path.read_text(encoding="utf-8").strip()
+                if disk_text:
+                    report_text = disk_text
+                    logger.info("[VEX] %s report loaded from WriteFile staging", cve_id)
+            except OSError as exc:
+                logger.warning(
+                    "[VEX] %s WriteFile staging report %s unreadable (%s); extracting from stream",
+                    cve_id, report_stage_path.name, exc,
+                )
+
+        if not report_text:
+            report_text = _extract_report_text(cleaned_response)
 
     statement = _extract_statement_from_vex(cve_id, vex_doc, 1)
-    # 실제로 사용된 모델을 statement 에 기록.  fallback 체인으로 Flash 로
-    # 넘어간 경우 여기서 used_model == "gemini-3-flash-preview" 이고 UI
-    # 에는 Flash 뱃지가 뜬다.
+    # 실제로 사용된 엔진:모델 을 statement 에 기록.  UI 는 이 값으로 PRO /
+    # CODEX / FLASH 배지를 구분한다.
     if used_model:
         statement.analysis_model = used_model
-        # vex_doc 에도 확장 필드로 써두면 재시작/복구 시 유지된다.
         if vex_doc.get("statements"):
             vex_doc["statements"][0]["x_firmcore_analysis_model"] = used_model
 
-    # ── Report: prefer Gemini's WriteFile staging, else extract ──────────
-    report_text = ""
-    if report_stage_path.exists():
-        try:
-            disk_text = report_stage_path.read_text(encoding="utf-8").strip()
-            if disk_text:
-                report_text = disk_text
-                logger.info("[VEX] %s report loaded from WriteFile staging", cve_id)
-        except OSError as exc:
-            logger.warning(
-                "[VEX] %s WriteFile staging report %s unreadable (%s); extracting from stream",
-                cve_id, report_stage_path.name, exc,
-            )
-
-    if not report_text:
-        report_text = _extract_report_text(cleaned_response)
     if not report_text and statement.impact_statement:
         report_text = statement.impact_statement
     statement.report_text = report_text
@@ -1975,12 +2053,19 @@ async def run_vex_analysis_loop(
         )
         logger.info("[VEX] 분석 보고서 저장: %s", report_path.name)
 
+    # _save_analysis_summary 에 넘기는 assistant content 는 아카이브용.
+    # Gemini 는 raw 터미널 스트림, Codex 는 최종 OpenVEX JSON 문자열 사용.
+    assistant_content = (
+        response
+        if used_engine == "gemini" and response is not None
+        else json.dumps(vex_doc, ensure_ascii=False, indent=2)
+    )
     _save_analysis_summary(
         cve_id=cve_id,
         product_info=product_info,
         history=[
             {"role": "user", "content": prompt},
-            {"role": "assistant", "content": response},
+            {"role": "assistant", "content": assistant_content},
         ],
         statement=statement,
         output_dir=output_dir,

@@ -117,19 +117,30 @@ export function VexBadge({
 }
 
 // ── ModelBadge ───────────────────────────────────────────────────────────────
-// "이 CVE 판정을 어느 Gemini 모델이 냈는지" 를 시각적으로 구분.  Pro 쿼터
-// 소진 시 Flash 로 자동 폴백된 결과는 FLASH 배지가 뜨므로 사용자가 Pro
-// 로 재분석할지 선택할 수 있다.
+// "이 CVE 판정을 어느 CLI/모델이 냈는지" 를 시각적으로 구분.  Pro 쿼터
+// 소진 시 Auto 체인(Pro → Codex → Flash) 중 어느 단계가 실제로 응답했는지
+// 한눈에 보이게 한다.
+//   - gemini-*-pro*   → PRO   (보라) : 최고 품질, Gemini Pro
+//   - gpt-*, o3*, codex-*, chatgpt-* → CODEX (에메랄드) : OpenAI Codex 폴백
+//   - gemini-*-flash* → FLASH (청)  : 쿼터 절약, Gemini Flash
+//   - 그 외 / 미지정   → AUTO  (회색)
+
+function _modelKind(m: string): 'pro' | 'codex' | 'flash' | 'auto' {
+  const s = m.toLowerCase()
+  if (s.startsWith('gpt-') || s.startsWith('o3') || s.startsWith('codex-') || s.startsWith('chatgpt-')) return 'codex'
+  if (s.includes('flash')) return 'flash'
+  if (s.includes('pro')) return 'pro'
+  return 'auto'
+}
 
 export function ModelBadge({ model }: { model: string | null | undefined }) {
   if (!model) return null
-  const isPro = model.includes('pro')
-  const isFlash = model.includes('flash')
-  const label = isPro ? 'PRO' : isFlash ? 'FLASH' : 'AUTO'
-  const cls = isPro
-    ? 'bg-purple-900/50 text-purple-300 border border-purple-700/40'
-    : isFlash
-    ? 'bg-cyan-900/40 text-cyan-300 border border-cyan-700/40'
+  const kind = _modelKind(model)
+  const label = kind === 'pro' ? 'PRO' : kind === 'flash' ? 'FLASH' : kind === 'codex' ? 'CODEX' : 'AUTO'
+  const cls =
+    kind === 'pro'   ? 'bg-purple-900/50 text-purple-300 border border-purple-700/40'
+    : kind === 'codex' ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700/40'
+    : kind === 'flash' ? 'bg-cyan-900/40 text-cyan-300 border border-cyan-700/40'
     : 'bg-surface-700 text-gray-400 border border-surface-500'
   return (
     <span

@@ -128,10 +128,14 @@ export function VexAnalysisTab({
     { key: 'unknown',             label: 'UNANALYZED',  count: stats.unknown,            active: 'bg-surface-700 text-gray-100 border-surface-500',  inactive: 'bg-surface-800/60 text-gray-500 border-surface-700 hover:bg-surface-700/60' },
   ]
 
-  // Re-analyze 는 Pro/Flash 2가지 모델 선택 가능한 분리 버튼.
-  // - Pro 버튼 : 품질 우선, 쿼터 많이 씀.  Flash 로 분석된 CVE 를
-  //              Pro 로 업그레이드할 때 주로 사용.
-  // - Flash 버튼 : 빠르고 쿼터 절약.  간단한 판정을 빠르게 재확인할 때.
+  // Re-analyze 는 Pro / Codex / Flash 3가지 엔진·모델 선택 가능한 분리 버튼.
+  // - Pro 버튼   : Gemini 3 Pro.  품질 우선, 쿼터 많이 씀.  Flash 로 분석된
+  //                CVE 를 Pro 로 업그레이드할 때 주로 사용.
+  // - Codex 버튼 : OpenAI gpt-5-codex.  Gemini Pro 쿼터가 나갔거나 Codex
+  //                구독 쿼터를 활용하고 싶을 때.  read-only 샌드박스로 동작.
+  // - Flash 버튼 : Gemini 3 Flash.  빠르고 쿼터 절약.  간단한 판정을 빠르게
+  //                재확인할 때.
+  // 모델 문자열의 prefix(gemini-*/gpt-*) 로 백엔드가 자동 엔진 라우팅.
   function RetryButtonGroup({ cveId }: { cveId: string }) {
     const isThis = retryingCve === cveId
     const isBusy = retryingCve !== null || resumingFromCve !== null
@@ -142,16 +146,25 @@ export function VexAnalysisTab({
         <button
           onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId, 'gemini-3-pro-preview') }}
           disabled={isBusy || !canRetry}
-          title={canRetry ? `${cveId} 를 Pro 모델로 재분석 (품질 우선, 쿼터 많이 씀)` : '분석 완료 후 사용 가능'}
+          title={canRetry ? `${cveId} 를 Gemini Pro 로 재분석 (품질 우선, 쿼터 많이 씀)` : '분석 완료 후 사용 가능'}
           className={`${baseCls} border-surface-600 hover:bg-purple-900/40 hover:text-purple-300 hover:border-purple-700/50`}
         >
           <Gem size={11} className={isThis ? 'animate-pulse' : ''} />
           {isThis ? '…' : 'Pro'}
         </button>
         <button
+          onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId, 'codex-default') }}
+          disabled={isBusy || !canRetry}
+          title={canRetry ? `${cveId} 를 OpenAI Codex 로 재분석 (CLI 기본 모델 자동 선택)` : '분석 완료 후 사용 가능'}
+          className={`${baseCls} border-surface-600 hover:bg-emerald-900/40 hover:text-emerald-300 hover:border-emerald-700/50`}
+        >
+          <Bot size={11} className={isThis ? 'animate-pulse' : ''} />
+          {isThis ? '…' : 'Codex'}
+        </button>
+        <button
           onClick={(e) => { e.stopPropagation(); void onRetryVexSingle(cveId, 'gemini-3-flash-preview') }}
           disabled={isBusy || !canRetry}
-          title={canRetry ? `${cveId} 를 Flash 모델로 재분석 (빠름, 쿼터 절약)` : '분석 완료 후 사용 가능'}
+          title={canRetry ? `${cveId} 를 Gemini Flash 로 재분석 (빠름, 쿼터 절약)` : '분석 완료 후 사용 가능'}
           className={`${baseCls} border-surface-600 hover:bg-cyan-900/40 hover:text-cyan-300 hover:border-cyan-700/50`}
         >
           <Zap size={11} className={isThis ? 'animate-pulse' : ''} />

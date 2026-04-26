@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FirmCore VEX Analysis Response",
+  "description": "Codex CLI --output-schema payload. Shape follows OpenVEX v0.2.0 plus FirmCore x_firmcore_* extensions.",
+  "type": "object",
+  "required": ["@context", "@id", "author", "timestamp", "version", "statements"],
+  "additionalProperties": true,
+  "properties": {
+    "@context":  { "const": "https://openvex.dev/ns/v0.2.0" },
+    "@id":       { "type": "string" },
+    "author":    { "type": "string" },
+    "role":      { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "version":   { "type": "integer", "minimum": 1 },
+    "statements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["vulnerability", "products", "status"],
+        "additionalProperties": true,
+        "properties": {
+          "vulnerability": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": true,
+            "properties": {
+              "@id":         { "type": "string" },
+              "name":        { "type": "string" },
+              "description": { "type": "string" },
+              "aliases":     { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "products": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["@id"],
+              "additionalProperties": true,
+              "properties": {
+                "@id":          { "type": "string" },
+                "identifiers":  { "type": "object", "additionalProperties": true },
+                "subcomponents":{ "type": "array",  "items": { "type": "object", "additionalProperties": true } }
+              }
+            }
+          },
+          "status": {
+            "enum": ["not_affected", "affected", "fixed", "under_investigation"]
+          },
+          "justification":    { "type": "string" },
+          "impact_statement": { "type": "string" },
+          "action_statement": { "type": "string" },
+          "x_firmcore_exploitability_tier": { "enum": ["low", "standard", null] },
+          "x_firmcore_analysis_model":      { "type": "string" },
+          "x_firmcore_report_md": {
+            "type": "string",
+            "description": "FirmCore 확장 — Codex 전용. 한국어 분석 보고서(Markdown) 전체 본문을 JSON 안에 임베드해 별도 파일 쓰기 없이 전달. 백엔드가 이 필드를 꺼내 {CVE-ID}_report.md 로 저장한 뒤 최종 OpenVEX JSON 에서는 제거한다."
+          }
+        }
+      }
+    }
+  }
+}
