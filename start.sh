@@ -101,19 +101,62 @@ setup_python() {
   ok "Python 의존성 준비 완료"
 }
 
-# ── sbom_claude_scripts 실행 권한 확인 ───────────────────────────────────────
-setup_sbom_bin() {
-  SBOM_BIN="${SBOM_BIN:-$SCRIPT_DIR/sbom_claude_scripts}"
-  if [[ -f "$SBOM_BIN" ]]; then
-    if [[ ! -x "$SBOM_BIN" ]]; then
-      chmod +x "$SBOM_BIN"
-      ok "sbom_claude_scripts 실행 권한 부여"
-    else
-      ok "sbom_claude_scripts 준비 완료"
-    fi
+# ── EMBA + CPE 후처리 파이프라인 부트스트랩 ──────────────────────────────────
+# 모든 도구가 Ubuntu WSL native:
+#   - EMBA           : docker 모드 (docker 그룹 멤버이면 sudo 불필요)
+#   - fix_cpe.py     : cpe_mapper venv 의 python 으로 호출
+#   - enrich_sbom.py : 같은 venv, cwd=cpe_mapper
+# 하나라도 없으면 백엔드 기동은 허용하되 분석 시 즉시 실패하므로 미리 경고.
+setup_emba() {
+  local missing=0
+  local emba_bin="${EMBA_BIN:-/home/ktdevice/work/emba/emba}"
+  local fix_cpe_bin="${FIX_CPE_BIN:-/home/ktdevice/fix_cpe.py}"
+  local cpe_mapper_dir="${CPE_MAPPER_DIR:-/home/ktdevice/cpe_mapper}"
+  local cpe_mapper_python="${CPE_MAPPER_PYTHON:-$cpe_mapper_dir/.venv/bin/python}"
+
+  # (1) EMBA 바이너리
+  if [[ -x "$emba_bin" ]]; then
+    ok "EMBA: $emba_bin"
   else
-    warn "sbom_claude_scripts 바이너리가 없습니다: $SBOM_BIN"
-    warn "SBOM 단계는 건너뛰거나 --mock 모드를 사용하세요."
+    warn "EMBA 바이너리 없음: $emba_bin"
+    missing=1
+  fi
+
+  # (2) docker 그룹 — EMBA wrapper 가 sudo 없이 동작하려면 필요
+  if groups | grep -qw docker; then
+    ok "docker 그룹 멤버 — EMBA sudo 없이 동작 OK"
+  else
+    warn "사용자가 docker 그룹에 없음 — EMBA 가 sudo 를 요구합니다."
+    warn "  $ sudo usermod -aG docker \$USER  (재로그인 또는 newgrp docker)"
+    missing=1
+  fi
+
+  # (3) docker daemon
+  if docker info >/dev/null 2>&1; then
+    ok "docker daemon 응답 OK"
+  else
+    warn "docker daemon 응답 없음 — sudo service docker start 또는 systemctl start docker"
+    missing=1
+  fi
+
+  # (4) fix_cpe.py
+  if [[ -f "$fix_cpe_bin" ]]; then
+    ok "fix_cpe.py: $fix_cpe_bin"
+  else
+    warn "fix_cpe.py 가 없습니다: $fix_cpe_bin"
+    missing=1
+  fi
+
+  # (5) cpe_mapper venv + enrich_sbom.py
+  if [[ -x "$cpe_mapper_python" && -f "$cpe_mapper_dir/enrich_sbom.py" ]]; then
+    ok "cpe_mapper: $cpe_mapper_dir (python: $cpe_mapper_python)"
+  else
+    warn "cpe_mapper 가 없습니다: dir=$cpe_mapper_dir python=$cpe_mapper_python"
+    missing=1
+  fi
+
+  if (( missing > 0 )); then
+    warn "EMBA 파이프라인 의존성 일부 누락 — 실제 분석 호출 시 실패합니다. --mock 으로 회피 가능."
   fi
 }
 
@@ -138,33 +181,42 @@ ok "storage/ 디렉토리 확인"
 start_backend() {
   info "백엔드 설정 중..."
   setup_python
-  setup_sbom_bin
+  setup_emba
 
   source backend/.venv/bin/activate
 
   BACKEND_ENV=(
     "MOCK_PIPELINE=$( $MOCK && echo true || echo false )"
-    "SBOM_BIN=${SBOM_BIN:-$SCRIPT_DIR/sbom_claude_scripts}"
     "STORAGE_DIR=$SCRIPT_DIR/storage"
-    "PATH=$PATH"
+    # wsl.exe 가 Ubuntu PATH 에 기본적으로 없는 경우가 있어 PATH 보강
+    "PATH=/mnt/c/Windows/System32:$PATH"
     "HOME=$HOME"
     # Codex CLI 가 OAuth 토큰을 읽는 경로.  명시해 두지 않으면 백엔드
     # subprocess 환경에서 ``HOME`` 이 누락되는 극단적 케이스에서 Codex 가
     # ``~/.codex/auth.json`` 을 못 찾아 인증 실패로 떨어진다.
     "CODEX_HOME=${CODEX_HOME:-$HOME/.codex}"
+    # EMBA + CPE 후처리 파이프라인 (모두 Ubuntu native) ──────────────
+    "EMBA_BIN=${EMBA_BIN:-/home/ktdevice/work/emba/emba}"
+    "EMBA_PROFILE=${EMBA_PROFILE:-default-sbom}"
+    "EMBA_TIMEOUT=${EMBA_TIMEOUT:-7200}"
+    "FIX_CPE_BIN=${FIX_CPE_BIN:-/home/ktdevice/fix_cpe.py}"
+    "CPE_MAPPER_DIR=${CPE_MAPPER_DIR:-/home/ktdevice/cpe_mapper}"
+    "CPE_MAPPER_PYTHON=${CPE_MAPPER_PYTHON:-/home/ktdevice/cpe_mapper/.venv/bin/python}"
+    "CPE_MAPPER_BACKEND=${CPE_MAPPER_BACKEND:-deterministic}"
+    "CPE_MAPPER_TIMEOUT=${CPE_MAPPER_TIMEOUT:-1800}"
   )
 
   if [[ -n "${GEMINI_API_KEY:-}" ]]; then
     BACKEND_ENV+=("GEMINI_API_KEY=$GEMINI_API_KEY")
   fi
 
-  kill_port 8080
+  kill_port 8000
 
   sep
   if $MOCK; then
-    info "백엔드 시작 (MOCK 모드) → http://localhost:8080"
+    info "백엔드 시작 (MOCK 모드) → http://localhost:8000"
   else
-    info "백엔드 시작 → http://localhost:8080"
+    info "백엔드 시작 → http://localhost:8000"
   fi
 
   # ``--reload`` 는 파일 저장 때마다 uvicorn 워커를 교체하는데, 진행 중
@@ -180,7 +232,7 @@ start_backend() {
   env "${BACKEND_ENV[@]}" \
     uvicorn main:app \
       --host 0.0.0.0 \
-      --port 8080 \
+      --port 8000 \
       "${reload_args[@]}" \
       --app-dir "$SCRIPT_DIR/backend" \
       --log-level info \
@@ -191,7 +243,7 @@ start_backend() {
   # 백엔드 헬스체크 대기
   info "백엔드 준비 대기 중..."
   for i in $(seq 1 20); do
-    if curl -sf http://localhost:8080/health &>/dev/null; then
+    if curl -sf http://localhost:8000/health &>/dev/null; then
       ok "백엔드 준비 완료 (${i}초)"
       break
     fi
@@ -234,10 +286,10 @@ start_frontend() {
 _CLEANUP_DONE=false
 
 kill_gemini_procs() {
-  # VEX 분석 CLI(Gemini / OpenAI Codex) 프로세스와 그 프로세스 그룹 전체를 종료.
-  # 두 CLI 모두 os.setsid 로 새 세션을 만들기 때문에 pgid 기반 kill 이 필요.
+  # VEX 분석 CLI(Gemini / OpenAI Codex) + EMBA / fix_cpe / enrich_sbom 프로세스
+  # 그룹 전체 종료.  모두 os.setsid 로 새 세션을 만들기 때문에 pgid 기반 kill.
   local pids
-  pids=$(pgrep -f "bin/gemini|bin/codex" 2>/dev/null || true)
+  pids=$(pgrep -f "bin/gemini|bin/codex|work/emba/emba|enrich_sbom\.py|fix_cpe\.py" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
     warn "잔여 VEX CLI 프로세스 종료: $(echo "$pids" | tr '\n' ' ')"
     while IFS= read -r pid; do
@@ -316,8 +368,8 @@ if $RUN_FRONTEND; then
   echo -e "  ${CYAN}프론트엔드${NC}   : http://localhost:5173"
 fi
 if $RUN_BACKEND; then
-  echo -e "  ${CYAN}백엔드 API${NC}   : http://localhost:8080"
-  echo -e "  ${CYAN}Swagger UI${NC}   : http://localhost:8080/api/docs"
+  echo -e "  ${CYAN}백엔드 API${NC}   : http://localhost:8000"
+  echo -e "  ${CYAN}Swagger UI${NC}   : http://localhost:8000/api/docs"
 fi
 echo -e "  ${GRAY}종료${NC}         : Ctrl+C"
 sep

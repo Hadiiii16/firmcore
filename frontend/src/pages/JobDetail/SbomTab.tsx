@@ -8,16 +8,20 @@ interface SbomTabProps {
 
 type SortKey = 'severity' | 'cve' | 'name'
 
-const SEVERITY_STYLE: Record<string, string> = {
-  CRITICAL: 'bg-red-950/60 text-red-300 border-red-900',
-  HIGH: 'bg-orange-950/60 text-orange-300 border-orange-900',
-  MEDIUM: 'bg-amber-950/60 text-amber-300 border-amber-900',
-  LOW: 'bg-blue-950/60 text-blue-300 border-blue-900',
-  UNKNOWN: 'bg-surface-700 text-gray-400 border-surface-600',
+const SEVERITY_TEXT: Record<string, string> = {
+  CRITICAL: 'text-red-400',
+  HIGH: 'text-orange-400',
+  MEDIUM: 'text-amber-400',
+  LOW: 'text-blue-400',
+  UNKNOWN: 'text-gray-500',
 }
 const SEVERITY_RANK: Record<string, number> = {
   CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1, UNKNOWN: 0,
 }
+const SEVERITY_SHORT: Record<string, string> = {
+  CRITICAL: 'C', HIGH: 'H', MEDIUM: 'M', LOW: 'L', UNKNOWN: '?',
+}
+const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'] as const
 
 function shortName(name: string): string {
   // File-type entries store the absolute rootfs path as name.  Show
@@ -139,8 +143,14 @@ export function SbomTab({ components }: SbomTabProps) {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-surface-700 bg-surface-800/50">
-              <th className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider w-20">CVES</th>
-              <th className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider w-24">WORST</th>
+              <th
+                className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider w-20"
+                title="이 패키지(name+version)와 매칭된 CVE 총 개수"
+              >CVES</th>
+              <th
+                className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider w-56"
+                title="심각도 등급별 CVE 개수 (C=Critical, H=High, M=Medium, L=Low)"
+              >SEVERITY</th>
               <th className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider">NAME</th>
               <th className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider">VERSION</th>
               <th className="text-left px-4 py-2.5 text-xs font-mono text-gray-500 tracking-wider">TYPE</th>
@@ -174,14 +184,23 @@ export function SbomTab({ components }: SbomTabProps) {
                       )}
                     </td>
                     <td className="px-4 py-2.5">
-                      {c.max_severity ? (
-                        <span
-                          className={`px-2 py-0.5 rounded text-xs font-mono border ${
-                            SEVERITY_STYLE[c.max_severity] ?? SEVERITY_STYLE.UNKNOWN
-                          }`}
-                        >
-                          {c.max_severity}
-                        </span>
+                      {c.cve_count > 0 ? (
+                        <div className="flex items-center gap-3 font-mono text-xs tabular-nums whitespace-nowrap">
+                          {SEVERITY_ORDER.map((sev) => {
+                            const n = c.severity_counts?.[sev] ?? 0
+                            if (n === 0) return null
+                            return (
+                              <span
+                                key={sev}
+                                className={SEVERITY_TEXT[sev] ?? SEVERITY_TEXT.UNKNOWN}
+                                title={`${sev}: ${n}`}
+                              >
+                                <span className="opacity-60">{SEVERITY_SHORT[sev]}</span>
+                                <span className="ml-1">{n}</span>
+                              </span>
+                            )
+                          })}
+                        </div>
                       ) : (
                         <span className="font-mono text-xs text-gray-700">—</span>
                       )}

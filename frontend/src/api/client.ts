@@ -91,6 +91,15 @@ export function retryVex(jobId: string): Promise<{ job_id: string; status: strin
   return request(`/jobs/${jobId}/retry-vex`, { method: 'POST' })
 }
 
+// Resume-from-SBOM — EMBA 가 만든 sbom.raw.json 에서 fix_cpe → enrich →
+// grype → VEX 단계를 이어 실행.  EMBA(20~60분짜리 단계) 를 다시 돌리지 않고
+// 후처리만 갈아끼우는 경량 재실행.
+export function resumeFromSbom(
+  jobId: string,
+): Promise<{ job_id: string; status: string; mode: string }> {
+  return request(`/jobs/${jobId}/resume-from-sbom`, { method: 'POST' })
+}
+
 export function resumeVex(jobId: string): Promise<{ job_id: string; status: string; mode: string }> {
   return request(`/jobs/${jobId}/resume-vex`, { method: 'POST' })
 }

@@ -1,7 +1,7 @@
 import { useState, useCallback, type MouseEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Shield, RefreshCw, Package, ShieldAlert, Activity, ChevronRight, Trash2,
+  RefreshCw, Package, ShieldAlert, Activity, ChevronRight, Trash2,
   AlertTriangle, CheckCircle2, HelpCircle, Upload as UploadIcon,
   ChevronDown, ChevronUp, ExternalLink,
 } from 'lucide-react'
@@ -393,11 +393,8 @@ export function Dashboard() {
     <div className="min-h-screen bg-surface-950">
       {/* Nav */}
       <nav className="border-b border-surface-700 bg-surface-900/80 backdrop-blur-sm sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-4 h-14 flex items-center gap-3">
-          <Shield size={20} className="text-accent-green glow-green" />
-          <span className="font-mono font-bold text-accent-green tracking-wider glow-green">
-            FIRMCORE
-          </span>
+        <div className="max-w-[1680px] mx-auto px-4 h-20 flex items-center gap-3">
+          <img src="/binxray_logo2.png" alt="binXray" className="h-16 w-auto select-none" />
           <span className="text-gray-600 font-mono text-xs">v1.0</span>
           <div className="ml-auto flex items-center gap-2">
             <button
@@ -418,7 +415,7 @@ export function Dashboard() {
         </div>
       </nav>
 
-      <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
+      <div className="max-w-[1680px] mx-auto px-4 py-6 space-y-6">
         {/* Upload modal strip */}
         {uploadOpen && (
           <div className="bg-surface-900 border border-surface-700 rounded-xl p-5">

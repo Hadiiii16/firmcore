@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
-import { ShieldAlert, Search, ChevronDown, ChevronUp } from 'lucide-react'
-import { SeverityBadge, VexBadge, ModelBadge } from '../../components/Badge'
+import { ShieldAlert, Search } from 'lucide-react'
+import { SeverityBadge } from '../../components/Badge'
 import type { CveResult } from '../../types'
 
 const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NEGLIGIBLE', 'UNKNOWN']
@@ -71,19 +71,10 @@ function CveRow({ cve }: { cve: CveResult }) {
         <td className="px-3 py-3 font-mono text-xs text-gray-400">
           {fmtNum(cve.risk_score, 1)}
         </td>
-        <td className="px-3 py-3">
-          <div className="flex items-center gap-1.5">
-            <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
-            <ModelBadge model={cve.analysis_model} />
-          </div>
-        </td>
-        <td className="px-3 py-3 text-gray-600">
-          {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-        </td>
       </tr>
       {expanded && (
         <tr className="bg-surface-900/60">
-          <td colSpan={9} className="px-6 pb-4 pt-2">
+          <td colSpan={7} className="px-6 pb-4 pt-2">
             <div className="space-y-3 text-sm text-gray-400">
               {cve.description && <p>{cve.description}</p>}
 
@@ -128,14 +119,6 @@ function CveRow({ cve }: { cve: CveResult }) {
                 )}
               </div>
 
-              {cve.vex_justification && (
-                <p className="font-mono text-xs">
-                  Justification: <span className="text-gray-300">{cve.vex_justification}</span>
-                </p>
-              )}
-              {cve.vex_detail && (
-                <p className="text-xs text-gray-500 italic whitespace-pre-wrap">{cve.vex_detail}</p>
-              )}
             </div>
           </td>
         </tr>
@@ -246,14 +229,12 @@ export function VulnerabilitiesTab({ cves }: VulnerabilitiesTabProps) {
               <th className="text-left px-3 py-2.5 text-xs font-mono text-gray-500 tracking-wider" title="CVSS v3 base score (0–10)">CVSS</th>
               <th className="text-left px-3 py-2.5 text-xs font-mono text-gray-500 tracking-wider" title="Exploit Prediction Scoring System — probability of exploit in next 30d">EPSS</th>
               <th className="text-left px-3 py-2.5 text-xs font-mono text-gray-500 tracking-wider" title="grype-composed risk score (CVSS × EPSS)">RISK</th>
-              <th className="text-left px-3 py-2.5 text-xs font-mono text-gray-500 tracking-wider">VEX</th>
-              <th className="px-3 py-2.5" />
             </tr>
           </thead>
           <tbody className="divide-y divide-surface-800">
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={9} className="text-center py-8 text-gray-600 font-mono text-sm">
+                <td colSpan={7} className="text-center py-8 text-gray-600 font-mono text-sm">
                   No vulnerabilities found
                 </td>
               </tr>

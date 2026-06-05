@@ -329,7 +329,8 @@ async def get_job_result(job_id: str) -> JobResult:
             vex_status=vex_map.get(v["cve_id"], {}).get("status", "unknown"),
             vex_justification=vex_map.get(v["cve_id"], {}).get("justification"),
             vex_detail=vex_map.get(v["cve_id"], {}).get("vex_detail"),
-            exploitability_tier=vex_map.get(v["cve_id"], {}).get("exploitability_tier"),
+            analysis_grade=vex_map.get(v["cve_id"], {}).get("analysis_grade"),
+            analysis_evidence=vex_map.get(v["cve_id"], {}).get("analysis_evidence"),
             analysis_model=vex_map.get(v["cve_id"], {}).get("analysis_model"),
         )
         for v in raw_vulns
@@ -342,6 +343,10 @@ async def get_job_result(job_id: str) -> JobResult:
     live_affected = sum(1 for c in cve_results if c.vex_status == "affected")
     live_not_affected = sum(1 for c in cve_results if c.vex_status == "not_affected")
     live_investigating = sum(1 for c in cve_results if c.vex_status == "under_investigation")
+
+    # Resume-from-SBOM 가능 조건: sbom.raw.json 존재.  EMBA 가 만들어둔 raw SBOM
+    # 이 디스크에 있으면 fix_cpe / enrich / grype / VEX 만 재실행할 수 있다.
+    resume_from_sbom = bool(storage_dir and (storage_dir / "sbom.raw.json").exists())
 
     return JobResult(
         id=job["id"],
@@ -365,7 +370,87 @@ async def get_job_result(job_id: str) -> JobResult:
         error_message=job.get("error_message"),
         created_at=job["created_at"],
         completed_at=job.get("completed_at"),
+        resume_from_sbom_available=resume_from_sbom,
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs/{job_id}/resume-from-sbom — EMBA 후처리부터 이어서
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{job_id}/resume-from-sbom", status_code=202)
+async def resume_from_sbom(job_id: str, background_tasks: BackgroundTasks) -> dict:
+    """``storage/<job>/sbom.raw.json`` 부터 fix_cpe → enrich_sbom → grype → VEX
+    까지 이어서 실행한다.
+
+    EMBA 추출/SBOM 생성 단계 (가장 무거운 20~60분 단계) 가 이미 끝나 sbom.raw.json
+    이 있을 때, fix_cpe 등 후속 단계에서 실패한 잡을 처음부터 다시 돌리지 않고
+    살리기 위한 엔드포인트.
+
+    조건:
+    - 잡 상태가 ``failed`` 이거나 ``sbom_generating`` 단계에서 멈춤
+    - ``storage/<job>/sbom.raw.json`` 존재
+    """
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job을 찾을 수 없습니다: {job_id}")
+
+    storage_dir = Path(job["storage_dir"]) if job.get("storage_dir") else None
+    if not storage_dir:
+        raise HTTPException(status_code=422, detail="storage_dir 없음")
+    sbom_raw = storage_dir / "sbom.raw.json"
+    if not sbom_raw.exists():
+        raise HTTPException(
+            status_code=422,
+            detail=f"sbom.raw.json 이 없습니다 ({sbom_raw}). EMBA 단계가 완료되지 않은 잡입니다 — "
+                   f"처음부터 다시 업로드해야 합니다.",
+        )
+
+    # 후처리·이후 단계의 stale 산출물 폐기 (재실행 시 중복 / 일관성 문제 방지)
+    for stale in (
+        storage_dir / "sbom.fix.json",
+        storage_dir / "sbom.cdx.json",
+        storage_dir / "sbom.cdx.audit.json",
+        storage_dir / "cpe_mapper.log",
+        storage_dir / "scan.json",
+        storage_dir / "combined_vex.json",
+    ):
+        if stale.exists():
+            stale.unlink(missing_ok=True)
+    vex_dir = storage_dir / "vex"
+    if vex_dir.exists():
+        shutil.rmtree(vex_dir, ignore_errors=True)
+
+    async with get_db() as db:
+        await db_update_job(
+            db, job_id,
+            status="sbom_generating",
+            current_stage="sbom_generating",
+            stage_progress=0,
+            sbom_path=None,
+            scan_result_path=None,
+            combined_vex_path=None,
+            component_count=0,
+            not_affected_count=0,
+            affected_count=0,
+            under_investigation_count=0,
+            error_message=None,
+            completed_at=None,
+        )
+
+    import os
+    from pipeline.runner import run_from_existing_sbom
+    from pipeline.mock import run_mock_pipeline
+
+    MOCK = os.environ.get("MOCK_PIPELINE", "false").lower() == "true"
+    if MOCK:
+        background_tasks.add_task(run_mock_pipeline, job_id)
+    else:
+        background_tasks.add_task(run_from_existing_sbom, job_id)
+
+    return {"job_id": job_id, "status": "sbom_generating", "mode": "resume-from-sbom"}
 
 
 # ---------------------------------------------------------------------------
@@ -722,18 +807,31 @@ def _load_sbom_components(
     if not path or not path.exists():
         return []
 
-    # (name, version) → (count, max_rank, max_label)
-    cve_index: dict[tuple[str, str], tuple[int, int, str]] = {}
+    # bom-ref 가 우선, (name, version) 은 fallback.  grype 는 SBOM 의 bom-ref
+    # 를 artifact.id 로 그대로 보존하므로 EMBA 의 group/name 합본 같은 표기
+    # 차이와 무관하게 정확한 매칭이 가능하다.
+    # 값: (total_count, max_rank, max_label, severity_counts_dict)
+    by_ref: dict[str, tuple[int, int, str, dict[str, int]]] = {}
+    by_name: dict[tuple[str, str], tuple[int, int, str, dict[str, int]]] = {}
     for m in scan_results or []:
-        key = (m.get("package_name", ""), m.get("package_version", ""))
         sev = (m.get("severity") or "UNKNOWN").upper()
         rank = _SEVERITY_RANK.get(sev, 0)
-        prev_count, prev_rank, prev_label = cve_index.get(key, (0, -1, ""))
-        cve_index[key] = (
-            prev_count + 1,
-            max(prev_rank, rank),
-            sev if rank > prev_rank else prev_label,
-        )
+        ref = m.get("bom_ref", "") or ""
+        name_key = (m.get("package_name", ""), m.get("package_version", ""))
+        for bucket, k in ((by_ref, ref), (by_name, name_key)):
+            if not k:
+                continue
+            prev_count, prev_rank, prev_label, prev_counts = bucket.get(
+                k, (0, -1, "", {})
+            )
+            counts = dict(prev_counts)
+            counts[sev] = counts.get(sev, 0) + 1
+            bucket[k] = (
+                prev_count + 1,
+                max(prev_rank, rank),
+                sev if rank > prev_rank else prev_label,
+                counts,
+            )
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -750,7 +848,10 @@ def _load_sbom_components(
         if key in seen:
             continue
         seen.add(key)
-        cve_count, _, max_label = cve_index.get(key, (0, -1, None))
+        ref = c.get("bom-ref", "") or ""
+        cve_count, _, max_label, sev_counts = (
+            by_ref.get(ref) or by_name.get(key, (0, -1, None, {}))
+        )
         results.append(
             SbomComponent(
                 name=name,
@@ -764,6 +865,7 @@ def _load_sbom_components(
                 ],
                 cve_count=cve_count,
                 max_severity=max_label or None,
+                severity_counts=sev_counts,
             )
         )
     return results
@@ -788,9 +890,16 @@ def _load_scan_results(
         for match in data.get("matches", []):
             vuln = match.get("vulnerability", {})
             artifact = match.get("artifact", {})
+            # EMBA SBOM 은 component 의 group 필드에 vendor 를, name 에 product 만
+            # 두는데 grype 는 SBOM 을 읽으면서 artifact.name 을
+            # "<group>/<name>" 으로 합쳐 방출한다 (예: "OpenWRT/alsa-lib").
+            # 표시·매칭 일관성을 위해 슬래시 뒤만 남겨 product name 으로 정규화.
+            raw_name = artifact.get("name", "") or ""
+            display_name = raw_name.rsplit("/", 1)[-1] if "/" in raw_name else raw_name
+            bom_ref = artifact.get("id", "") or ""
             key = (
                 vuln.get("id", "UNKNOWN"),
-                artifact.get("name", ""),
+                display_name,
                 artifact.get("version", ""),
             )
             if key in seen:
@@ -815,6 +924,7 @@ def _load_scan_results(
                 "cve_id": key[0],
                 "package_name": key[1],
                 "package_version": key[2],
+                "bom_ref": bom_ref,
                 "severity": vuln.get("severity", "UNKNOWN").upper(),
                 "description": vuln.get("description", ""),
                 "fix_version": fix_versions[0] if fix_versions else None,
@@ -832,100 +942,145 @@ def _load_scan_results(
         return []
 
 
-_VEX_TIER_RE = re.compile(
-    r"\[EXPLOITABILITY_TIER:\s*(LOW|STANDARD|NONE)\]",
-    re.IGNORECASE,
-)
+_VEX_GRADE_RE = re.compile(r"\[GRADE\s*:\s*([A-D])\]", re.IGNORECASE)
+_VEX_EVIDENCE_RE = re.compile(r"\[EVIDENCE\s*:\s*(HIGH|MEDIUM|LOW)\]", re.IGNORECASE)
 
 
-def _vex_tier_from_stmt(stmt: dict) -> Optional[str]:
-    """Resolve exploitability tier from an OpenVEX statement dict.
+def _vuln_id_from_stmt(stmt: dict) -> str:
+    """OpenVEX statement 의 ``vulnerability`` 에서 CVE ID 추출 (str/dict 호환).
 
-    Order:
-    1. Explicit ``x_firmcore_exploitability_tier`` field (set by newer runs).
-    2. ``[EXPLOITABILITY_TIER: …]`` prefix in ``impact_statement`` (older runs
-       where the field was not persisted but the prompt-mandated tag is).
-    3. ``None`` when status != "affected" (tier is only meaningful for affected).
-    4. ``"standard"`` as default for affected missing any hint.
+    OpenVEX 0.2.0 은 vulnerability 가 string("CVE-...") 또는 dict({"@id":..,
+    "name":..}) 두 표기를 모두 허용한다. v5.0 모델 출력은 string 형이라
+    기존 ``stmt.get("vulnerability", {}).get("name")`` 코드는 str 에서 .get
+    호출하다 ``'str' object has no attribute 'get'`` 으로 터졌다.
     """
-    status = stmt.get("status")
-    if status != "affected":
+    v = stmt.get("vulnerability")
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, dict):
+        name = v.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        vid = v.get("@id")
+        if isinstance(vid, str) and "/" in vid:
+            return vid.rsplit("/", 1)[-1]
+    return ""
+
+
+def _vex_grade_from_stmt(stmt: dict) -> Optional[str]:
+    """Resolve GRADE (B/C/D) from an OpenVEX statement.
+
+    Only meaningful when status == "affected".  Order:
+    1. Explicit ``x_firmcore_grade`` field (set by v5.0+ runs).
+    2. ``[GRADE: …]`` prefix in ``impact_statement``.
+    3. ``None`` otherwise.
+    """
+    if stmt.get("status") != "affected":
         return None
-    raw = stmt.get("x_firmcore_exploitability_tier")
-    if isinstance(raw, str) and raw.lower() in ("low", "standard"):
-        return raw.lower()
-    m = _VEX_TIER_RE.search(stmt.get("impact_statement") or "")
-    if m:
-        val = m.group(1).lower()
-        if val in ("low", "standard"):
-            return val
-    return "standard"
+    raw = stmt.get("x_firmcore_grade")
+    if isinstance(raw, str) and raw.upper() in ("A", "B", "C", "D"):
+        return raw.upper()
+    m = _VEX_GRADE_RE.search(stmt.get("impact_statement") or "")
+    return m.group(1).upper() if m else None
+
+
+def _vex_evidence_from_stmt(stmt: dict) -> Optional[str]:
+    """Resolve evidence confidence (HIGH/MEDIUM/LOW) from a statement."""
+    raw = stmt.get("x_firmcore_evidence")
+    if isinstance(raw, str) and raw.upper() in ("HIGH", "MEDIUM", "LOW"):
+        return raw.upper()
+    m = _VEX_EVIDENCE_RE.search(stmt.get("impact_statement") or "")
+    return m.group(1).upper() if m else None
+
+
+def _stmt_to_map_entry(
+    stmt: dict,
+    vex_dir: Optional[Path],
+    cve_name: str,
+) -> dict:
+    """단일 OpenVEX statement → vex_map 항목 dict 변환 (공용 헬퍼)."""
+    report_text: Optional[str] = None
+    if vex_dir is not None:
+        report_file = vex_dir / f"{cve_name}_report.md"
+        if report_file.exists():
+            try:
+                report_text = report_file.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    return {
+        "status": stmt.get("status", "unknown"),
+        "justification": stmt.get("justification"),
+        "vex_detail": report_text or stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
+        "analysis_grade": _vex_grade_from_stmt(stmt),
+        "analysis_evidence": _vex_evidence_from_stmt(stmt),
+        "analysis_model": stmt.get("x_firmcore_analysis_model"),
+    }
 
 
 def _load_vex(
     storage_dir: Optional[Path],
     vex_path_str: Optional[str],
 ) -> tuple[Optional[dict], dict[str, dict]]:
-    """
-    VEX 상태 매핑을 로드합니다.
+    """VEX 상태 매핑을 로드합니다.
 
-    1순위: combined_vex.json (배치 완료 후 생성)
-    2순위: vex/ 디렉토리 내 개별 {CVE-ID}_vex.json (분석 중 점진적 갱신)
+    두 소스를 **mtime-aware merge** 합니다 — 분석 진행 중에는 개별
+    ``vex/{CVE}_vex.json`` 만 새로 갱신되고 ``combined_vex.json`` 은 batch
+    또는 단일 CVE 종료 후에만 재빌드되므로, combined 만 신뢰하면 화면이
+    "있다가 없다가" 처럼 옛/새 상태를 오갈 수 있다.
+
+    규칙:
+      1. combined_vex.json 이 있으면 우선 그 statements 를 vex_map 에 채움.
+      2. vex/*_vex.json 중 mtime 이 combined 보다 **새것** 인 파일은 그 항목을
+         덮어쓰기 (분석 중에 막 떨어진 새 결과 반영).
+      3. combined 가 아예 없으면 모든 개별 파일을 그대로 vex_map 에 채움.
 
     Returns
     -------
-    (vex_document, {cve_id: {"status": ..., "justification": ..., "vex_detail": ...}})
+    (vex_document, {cve_id: {"status": ..., "vex_detail": ..., "analysis_grade": ..., ...}})
     """
-    # 1) combined_vex.json 로드 시도
-    path = _resolve_path(storage_dir, vex_path_str, "combined_vex.json")
-    if path and path.exists():
-        try:
-            vex_doc = json.loads(path.read_text(encoding="utf-8"))
-            vex_map: dict[str, dict] = {}
-            for stmt in vex_doc.get("statements", []):
-                cve_name = stmt.get("vulnerability", {}).get("name", "")
-                if cve_name:
-                    vex_map[cve_name] = {
-                        "status": stmt.get("status", "unknown"),
-                        "justification": stmt.get("justification"),
-                        "vex_detail": stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
-                        "exploitability_tier": _vex_tier_from_stmt(stmt),
-                        "analysis_model": stmt.get("x_firmcore_analysis_model"),
-                    }
-            return vex_doc, vex_map
-        except Exception:
-            logger.warning("combined_vex.json 파싱 실패: %s", path)
+    vex_map: dict[str, dict] = {}
+    vex_doc: Optional[dict] = None
+    combined_mtime: float = 0.0
+    vex_dir: Optional[Path] = None
+    if storage_dir is not None:
+        vex_dir_candidate = storage_dir / "vex"
+        if vex_dir_candidate.exists():
+            vex_dir = vex_dir_candidate
 
-    # 2) 개별 CVE VEX 파일 로드 (분석 중간 — combined_vex.json 미생성 상태)
-    vex_map = {}
-    if storage_dir:
-        vex_dir = storage_dir / "vex"
-        if vex_dir.exists():
-            for vex_file in sorted(vex_dir.glob("*_vex.json")):
-                try:
-                    doc = json.loads(vex_file.read_text(encoding="utf-8"))
-                    for stmt in doc.get("statements", []):
-                        cve_name = stmt.get("vulnerability", {}).get("name", "")
-                        if not cve_name:
-                            continue
-                        # 보고서 텍스트: _report.md 우선
-                        report_text: Optional[str] = None
-                        report_file = vex_dir / f"{cve_name}_report.md"
-                        if report_file.exists():
-                            try:
-                                report_text = report_file.read_text(encoding="utf-8")
-                            except Exception:
-                                pass
-                        vex_map[cve_name] = {
-                            "status": stmt.get("status", "unknown"),
-                            "justification": stmt.get("justification"),
-                            "vex_detail": report_text or stmt.get("x_firmcore_report") or stmt.get("impact_statement"),
-                            "exploitability_tier": _vex_tier_from_stmt(stmt),
-                            "analysis_model": stmt.get("x_firmcore_analysis_model"),
-                        }
-                except Exception:
+    # 1) combined_vex.json 우선 로드
+    combined_path = _resolve_path(storage_dir, vex_path_str, "combined_vex.json")
+    if combined_path and combined_path.exists():
+        try:
+            vex_doc = json.loads(combined_path.read_text(encoding="utf-8"))
+            combined_mtime = combined_path.stat().st_mtime
+            for stmt in vex_doc.get("statements", []):
+                cve_name = _vuln_id_from_stmt(stmt)
+                if cve_name:
+                    vex_map[cve_name] = _stmt_to_map_entry(stmt, vex_dir, cve_name)
+        except Exception:
+            logger.warning("combined_vex.json 파싱 실패: %s", combined_path)
+            vex_doc = None
+            combined_mtime = 0.0
+
+    # 2) 개별 vex/*_vex.json 중 combined 보다 새것은 덮어쓰기
+    #    (combined 가 없을 때는 combined_mtime=0 이라 모든 파일이 새것 취급)
+    if vex_dir is not None:
+        for vex_file in sorted(vex_dir.glob("*_vex.json")):
+            try:
+                file_mtime = vex_file.stat().st_mtime
+                if file_mtime <= combined_mtime:
+                    # 이미 combined 에 반영된 stale 파일 — 스킵
                     continue
-    return None, vex_map
+                doc = json.loads(vex_file.read_text(encoding="utf-8"))
+                for stmt in doc.get("statements", []):
+                    cve_name = _vuln_id_from_stmt(stmt)
+                    if not cve_name:
+                        continue
+                    vex_map[cve_name] = _stmt_to_map_entry(stmt, vex_dir, cve_name)
+            except Exception:
+                continue
+
+    return vex_doc, vex_map
 
 
 def _resolve_path(

@@ -1,8 +1,8 @@
 import { useState, type ReactNode } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  Shield, ArrowLeft, Clock, Package, ShieldAlert, Bot, Terminal, RefreshCw,
-  CircleStop, Hourglass,
+  ArrowLeft, Clock, Package, ShieldAlert, Bot, Terminal, RefreshCw,
+  CircleStop, Hourglass, FastForward,
 } from 'lucide-react'
 import { useJobDetail } from '../hooks/useJobDetail'
 import { PipelineStepper } from '../components/PipelineStepper'
@@ -35,7 +35,7 @@ export function JobDetail() {
   // 페이지 진입 시 기본 탭도 VEX Analysis (= 최종 산출물).
   const [activeTab, setActiveTab] = useState<Tab>('vex')
 
-  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, resuming, cancelling, retryingCve, resumingFromCve, retryVex, resumeVex, resumeVexFrom, retryVexSingle, cancelVex } =
+  const { result, logs, status, currentStage, stageProgress, errorMessage, streaming, retrying, resuming, cancelling, retryingCve, resumingFromCve, retryVex, resumeVex, resumeVexFrom, retryVexSingle, cancelVex, resumeFromSbom } =
     useJobDetail(jobId!)
 
   const tabs: TabConfig[] = [
@@ -69,11 +69,13 @@ export function JobDetail() {
     <div className="min-h-screen bg-surface-950">
       {/* Nav */}
       <nav className="border-b border-surface-700 bg-surface-900/80 backdrop-blur-sm sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-4 h-14 flex items-center gap-3">
-          <Shield size={20} className="text-accent-green glow-green" />
-          <span className="font-mono font-bold text-accent-green tracking-wider glow-green">
-            FIRMCORE
-          </span>
+        <div className="max-w-[1680px] mx-auto px-4 h-20 flex items-center gap-3">
+          <img
+            src="/binxray_logo2.png"
+            alt="binXray"
+            className="h-16 w-auto select-none cursor-pointer"
+            onClick={() => navigate('/')}
+          />
           <span className="text-gray-700">/</span>
           <button
             onClick={() => navigate('/')}
@@ -87,7 +89,7 @@ export function JobDetail() {
         </div>
       </nav>
 
-      <div className="max-w-6xl mx-auto px-4 py-8 space-y-6">
+      <div className="max-w-[1680px] mx-auto px-4 py-8 space-y-6">
         {/* Header */}
         <div className="bg-surface-900 border border-surface-700 rounded-xl p-5 space-y-4">
           <div className="flex items-start justify-between gap-4">
@@ -194,11 +196,33 @@ export function JobDetail() {
               )
             }
 
+            // SBOM 후처리 단계에서 깨졌고 EMBA 산출물(sbom.raw.json) 이 있으면
+            // EMBA 부터 다시 돌리지 않고 fix_cpe → enrich → grype → VEX 만
+            // 이어 진행할 수 있도록 "Resume from SBOM" 버튼을 함께 노출.
+            const canResumeFromSbom = canAct && Boolean(result?.resume_from_sbom_available)
             return (
               <div className="flex items-start gap-3 bg-red-900/20 border border-red-800/40 rounded-lg px-4 py-2">
                 <p className="text-sm text-red-400 font-mono flex-1">✗ {cleaned}</p>
                 {canAct && (
                   <div className="flex items-center gap-2 shrink-0">
+                    {canResumeFromSbom && (
+                      <button
+                        onClick={() => {
+                          if (window.confirm(
+                            'EMBA 가 만든 sbom.raw.json 부터 fix_cpe → enrich → grype → VEX 를 다시 진행합니다.\n' +
+                            '(EMBA 추출/SBOM 생성 단계는 재실행하지 않음)\n\n계속하시겠습니까?'
+                          )) {
+                            void resumeFromSbom()
+                          }
+                        }}
+                        disabled={resuming || retrying}
+                        title="EMBA 가 만든 sbom.raw.json 부터 후속 단계만 다시 실행 (EMBA 단계 skip)"
+                        className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-700/50 hover:bg-emerald-900/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <FastForward size={12} className={resuming ? 'animate-pulse' : ''} />
+                        {resuming ? 'Resuming…' : 'Resume from SBOM'}
+                      </button>
+                    )}
                     <button
                       onClick={() => {
                         if (window.confirm('기존 VEX 분석 결과를 모두 삭제하고 처음부터 다시 분석합니다. 계속하시겠습니까?')) {

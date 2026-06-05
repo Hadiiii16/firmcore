@@ -97,16 +97,19 @@ class CveResult(BaseModel):
     vex_status: str = "unknown"
     vex_justification: Optional[str] = None
     vex_detail: Optional[str] = None
-    # 커스텀 확장: status == "affected" 인 경우의 실전 exploitability 티어.
-    #   "low"       — 컴파일 완화(PIE+NX+Canary 등) 가 CVE 공격 유형을 실질
-    #                  차단하여 패치 우선순위를 낮출 수 있음
-    #   "standard"  — 일반 affected (시급 패치 대상)
-    #   None        — status != "affected" (tier 의미 없음)
-    exploitability_tier: Optional[str] = None
-    # 이 CVE 판정을 실제로 낸 Gemini 모델명.  Pro 쿼터 소진 시 Flash 로
+    # GEMINI.md v5.0 — ``affected`` 의 실전 위험도 등급.
+    #   "B"  — 일반 affected (도달 가능 + 완화 부족) → 패치 시급
+    #   "C"  — 도달 가능하지만 컴파일 완화로 exploit 난이도 상승
+    #   "D"  — 코드 + 실행 경로 존재하나 공격 표면 노출 증거 없음 (잠재 위험)
+    #   None — status != "affected"
+    analysis_grade: Optional[str] = None
+    # GEMINI.md v5.0 — 정적 분석 신뢰도.  HIGH / MEDIUM / LOW.
+    # 모든 status 에 적용 가능.  LOW 면 수동 추가 검증 권장.
+    analysis_evidence: Optional[str] = None
+    # 이 CVE 판정을 실제로 낸 분석 모델명.  Pro 쿼터 소진 시 Codex/Flash 로
     # 자동 폴백된 케이스가 있어 배치 기본 모델과 다를 수 있다.
-    # 프론트엔드는 이 값을 뱃지(``PRO``/``FLASH``)로 표시하고,
-    # Flash 로 분석된 CVE 를 Pro 로 재분석하도록 Re-analyze(Pro) 버튼을
+    # 프론트엔드는 이 값을 뱃지(``PRO`` / ``CODEX`` / ``FLASH``) 로 표시하고,
+    # Flash/Codex 로 분석된 CVE 를 Pro 로 재분석하도록 Re-analyze 버튼을
     # 활성화한다.  ``null`` = 모델 추적 전 데이터 또는 mock.
     analysis_model: Optional[str] = None
 
@@ -124,6 +127,8 @@ class SbomComponent(BaseModel):
     # "which packages need attention?" view without opening the CVE tab.
     cve_count: int = 0
     max_severity: Optional[str] = None  # CRITICAL / HIGH / MEDIUM / LOW / UNKNOWN
+    # 심각도 등급별 CVE 개수 — 키: CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN, 0 인 등급은 생략
+    severity_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class JobResult(BaseModel):
@@ -161,6 +166,11 @@ class JobResult(BaseModel):
     stage_timings: list[StageTiming] = Field(default_factory=list)
 
     error_message: Optional[str] = None
+
+    # Resume-from-SBOM 가능 여부 — EMBA 가 만든 sbom.raw.json 이 존재하는 경우.
+    # 잡이 fix_cpe / enrich_sbom / scanning / vex_analyzing 단계에서 실패했을
+    # 때 SBOM 부터 이어 진행 가능한지 프론트엔드가 판단하는 데 사용.
+    resume_from_sbom_available: bool = False
     created_at: str
     completed_at: Optional[str] = None
 

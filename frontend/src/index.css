@@ -8,6 +8,10 @@
   }
 
   html {
+    /* Tailwind 의 모든 rem 기반 사이즈(폰트·padding·gap)가 root font-size
+       에 비례 확대된다.  기본 16px → 17.5px (≈10% up) 으로 FHD 에서
+       가독성을 끌어올리되 한 화면 정보 밀도는 크게 해치지 않는다. */
+    font-size: 19px;
     color-scheme: dark;
     scrollbar-color: #2a2a35 #0e0e12;
     scrollbar-width: thin;
@@ -16,7 +20,15 @@
   body {
     background-color: #050507;
     color: #f1f5f9;
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: 'Pretendard Variable', Pretendard, -apple-system, BlinkMacSystemFont,
+      system-ui, Roboto, 'Helvetica Neue', 'Segoe UI', 'Apple SD Gothic Neo',
+      'Noto Sans KR', sans-serif;
+    /* Pretendard 의 권장 렌더링 옵션 + 다크 테마 가독성용 weight 살짝 up */
+    font-weight: 450;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    letter-spacing: -0.01em;
   }
 
   ::-webkit-scrollbar {

@@ -138,7 +138,7 @@ GEMINI_STREAM_LOG_CHARS = int(_get_env("VEX_GEMINI_STREAM_LOG_CHARS", "800"))
 # has begun.  With `<&0` in the bash wrapper gemini's Ink UI keeps stdin open
 # and never exits on its own after the final response — we detect completion
 # by idleness instead.
-GEMINI_IDLE_SHUTDOWN_S = int(_get_env("VEX_GEMINI_IDLE_SHUTDOWN", "45"))
+GEMINI_IDLE_SHUTDOWN_S = int(_get_env("VEX_GEMINI_IDLE_SHUTDOWN", "120"))
 # Number of bottom viewport lines treated as Ink's transient UI zone
 # (spinner / input prompt / footer).  Lines in this zone are *not* emitted
 # incrementally — only lines above it are considered "stable enough" to
@@ -416,11 +416,18 @@ class VexStatement:
     impact_statement: str
     analysis_turns: int = 0
     report_text: str = ""   # 분석 요약 보고서 (OpenVEX JSON 앞의 텍스트)
-    # ``low``  — compile-time mitigations sufficiently cover the CVE's
-    #             primary attack class (Stack BOF w/ Canary+NX+PIE etc.)
-    # ``standard`` — default for affected
-    # ``None``  — status != affected (not_affected / fixed / under_investigation)
-    exploitability_tier: Optional[str] = None
+    # GEMINI.md v5.0 — ``affected`` 의 세분화 등급.  ``B`` / ``C`` / ``D``
+    # (드물게 ``A`` 가 잘못 들어올 수 있음 — GEMINI.md 가 발행 금지).
+    # ``not_affected`` / ``under_investigation`` / ``fixed`` 는 ``None``.
+    #   - B: 일반 affected (도달 가능 + 완화 부족) → 패치 시급
+    #   - C: 도달 가능하지만 컴파일 완화로 exploit 난이도 상승
+    #   - D: 코드 + 실행 경로 존재하나 공격 표면 노출 증거 없음 (잠재 위험)
+    analysis_grade: Optional[str] = None
+    # GEMINI.md v5.0 — 판정 신뢰도.  ``HIGH`` / ``MEDIUM`` / ``LOW``.
+    # 모든 status 에 적용 가능.  Stripped binary, NVRAM 의존, dlopen 모호성
+    # 등으로 정적 분석 한계가 있을 때 LOW 로 표기되어 사용자가 수동 검증
+    # 우선순위를 가늠할 수 있게 한다.
+    analysis_evidence: Optional[str] = None
     # 이 CVE 를 실제 분석하는 데 사용된 Gemini 모델명.  Pro 쿼터 소진
     # 시 Flash 로 자동 폴백되는 경우가 있어 배치 시작 시 지정한 모델과
     # 다를 수 있다.  UI 에서 "이 판정은 어느 모델의 분석 결과인지"
@@ -660,7 +667,32 @@ def clean_gemini_response(response: str) -> str:
 
 def _is_openvex(data: dict) -> bool:
     ctx = data.get("@context", "")
-    return isinstance(ctx, str) and "openvex.dev" in ctx
+    # 공식 namespace 는 openvex.dev 지만 모델이 종종 ``openvex.io`` 로 잘못
+    # 적기도 한다 (Gemini v5.0 출력에서 관찰).  둘 다 OpenVEX 로 인정.
+    return isinstance(ctx, str) and ("openvex.dev" in ctx or "openvex.io" in ctx)
+
+
+def _vuln_id_from_stmt(stmt: dict) -> str:
+    """OpenVEX statement 의 ``vulnerability`` 필드에서 CVE ID 추출.
+
+    OpenVEX 0.2.0 은 다음 두 표기를 모두 허용한다:
+      1. dict — ``{"@id": "...", "name": "CVE-...", ...}``  (기존 v4.0 스타일)
+      2. str  — ``"CVE-2025-68160"``                         (단축, v5.0 출력)
+
+    파서가 두 형태 모두 안전하게 다루도록 이 헬퍼를 거친다.
+    """
+    v = stmt.get("vulnerability")
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, dict):
+        name = v.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        # @id 가 ``https://nvd.nist.gov/vuln/detail/CVE-...`` 형태면 마지막 segment
+        vid = v.get("@id")
+        if isinstance(vid, str) and "/" in vid:
+            return vid.rsplit("/", 1)[-1]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -668,31 +700,45 @@ def _is_openvex(data: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
-_EXPLOITABILITY_TIER_RE = re.compile(
-    r"\[EXPLOITABILITY_TIER:\s*(LOW|STANDARD|NONE)\]",
+# GEMINI.md v5.0 — ``impact_statement`` 에 강제되는 두 prefix.  순서는 자유
+# (``[EVIDENCE: HIGH] [GRADE: B] ...`` 또는 반대 모두 허용).
+_EVIDENCE_RE = re.compile(
+    r"\[EVIDENCE\s*:\s*(HIGH|MEDIUM|LOW)\]",
+    re.IGNORECASE,
+)
+_GRADE_RE = re.compile(
+    r"\[GRADE\s*:\s*([A-D])\]",
     re.IGNORECASE,
 )
 
 
-def _extract_tier(status: str, impact_statement: str) -> Optional[str]:
-    """Pull ``exploitability_tier`` out of the ``[EXPLOITABILITY_TIER: …]``
-    prefix that GEMINI.md mandates in ``impact_statement``.
+def _extract_grade(status: str, impact_statement: str) -> Optional[str]:
+    """``[GRADE: D|C|B]`` prefix 에서 GRADE 추출.
 
     Rules:
-    - Only ``affected`` carries a meaningful tier (``low`` / ``standard``).
-    - Other statuses return ``None`` regardless of what the prefix says.
-    - Missing / malformed prefix on an ``affected`` statement defaults to
-      ``standard`` so the UI never shows an empty badge.
+    - ``affected`` 상태에서만 의미 있음 — 다른 status 는 항상 ``None``.
+    - ``affected`` 인데 prefix 가 없거나 잘못된 값이면 ``None`` 반환.
+    - ``A`` 는 GEMINI.md 가 발행 금지하지만, 만약 모델이 잘못 적어 보냈다면
+      그대로 보존 (사용자가 보고 판단할 수 있게).
     """
     if status != "affected":
         return None
-    match = _EXPLOITABILITY_TIER_RE.search(impact_statement or "")
+    match = _GRADE_RE.search(impact_statement or "")
     if not match:
-        return "standard"
-    value = match.group(1).lower()
-    if value == "none":
-        return "standard"
-    return value  # ``low`` | ``standard``
+        return None
+    return match.group(1).upper()  # "B" | "C" | "D" | (rare) "A"
+
+
+def _extract_evidence(impact_statement: str) -> Optional[str]:
+    """``[EVIDENCE: HIGH|MEDIUM|LOW]`` prefix 에서 신뢰도 추출.
+
+    모든 status 에서 의미 있음 (not_affected / affected / under_investigation).
+    Prefix 가 없으면 ``None`` — 이전 분석본은 evidence 가 비어 있다.
+    """
+    match = _EVIDENCE_RE.search(impact_statement or "")
+    if not match:
+        return None
+    return match.group(1).upper()  # "HIGH" | "MEDIUM" | "LOW"
 
 
 def _extract_statement_from_vex(
@@ -706,13 +752,18 @@ def _extract_statement_from_vex(
         s = stmts[0]
         status = s.get("status", "under_investigation")
         impact = s.get("impact_statement", "")
+        # 우선 OpenVEX 확장 필드를 그대로 신뢰.  없으면 impact_statement
+        # prefix 에서 직접 파싱 (Gemini/Codex 가 확장 필드를 깜빡한 경우).
+        grade = s.get("x_firmcore_grade") or _extract_grade(status, impact)
+        evidence = s.get("x_firmcore_evidence") or _extract_evidence(impact)
         return VexStatement(
             cve_id=cve_id,
             status=status,
             justification=s.get("justification"),
             impact_statement=impact,
             analysis_turns=turns_used,
-            exploitability_tier=_extract_tier(status, impact),
+            analysis_grade=grade.upper() if isinstance(grade, str) else None,
+            analysis_evidence=evidence.upper() if isinstance(evidence, str) else None,
             analysis_model=s.get("x_firmcore_analysis_model"),
         )
     return VexStatement(
@@ -2360,13 +2411,13 @@ def _build_combined_vex(
         # affected 상태에는 justification 미포함 (OpenVEX 스펙)
         if s.justification and s.status not in ("affected", "under_investigation"):
             stmt["justification"] = s.justification
-        # Custom FirmCore extension: affected 상태의 세부 카테고리.  OpenVEX
-        # 표준 외 필드이므로 ``x_firmcore_`` 접두사를 붙인다.
-        if s.exploitability_tier:
-            stmt["x_firmcore_exploitability_tier"] = s.exploitability_tier
-        # 이 판정을 낸 Gemini 모델 이름.  Pro 쿼터 소진 시 Flash 로 자동
-        # 폴백되는 케이스가 있어 Pro vs Flash 구분 + 추후 재분석 UX 에
-        # 필요하다.
+        # FirmCore 확장 필드.  GEMINI.md v5.0 GRADE 체계를 OpenVEX 위에 얹는다.
+        if s.analysis_grade:
+            stmt["x_firmcore_grade"] = s.analysis_grade
+        if s.analysis_evidence:
+            stmt["x_firmcore_evidence"] = s.analysis_evidence
+        # 이 판정을 낸 분석 모델 이름.  Pro 쿼터 소진 시 Codex/Flash 로 자동
+        # 폴백되는 케이스가 있어 모델 구분 + 추후 재분석 UX 에 필요하다.
         if s.analysis_model:
             stmt["x_firmcore_analysis_model"] = s.analysis_model
         if s.report_text:
@@ -2400,7 +2451,7 @@ def rebuild_combined_vex_from_dir(
         try:
             doc = json.loads(vex_file.read_text(encoding="utf-8"))
             for stmt_dict in doc.get("statements", []):
-                cve_id = stmt_dict.get("vulnerability", {}).get("name", "")
+                cve_id = _vuln_id_from_stmt(stmt_dict)
                 if not cve_id:
                     continue
                 # 개별 {cve}_vex.json 은 Gemini 가 WriteFile 로 쓴 원본
@@ -2421,9 +2472,9 @@ def rebuild_combined_vex_from_dir(
                             )
                 status = stmt_dict.get("status", "under_investigation")
                 impact = stmt_dict.get("impact_statement", "")
-                tier = stmt_dict.get("x_firmcore_exploitability_tier")
-                if tier is None:
-                    tier = _extract_tier(status, impact)
+                # 확장 필드 우선, 없으면 impact_statement prefix 에서 추출
+                grade = stmt_dict.get("x_firmcore_grade") or _extract_grade(status, impact)
+                evidence = stmt_dict.get("x_firmcore_evidence") or _extract_evidence(impact)
                 stmt = VexStatement(
                     cve_id=cve_id,
                     status=status,
@@ -2431,7 +2482,8 @@ def rebuild_combined_vex_from_dir(
                     impact_statement=impact,
                     analysis_turns=stmt_dict.get("x_firmcore_turns", 0),
                     report_text=report_text,
-                    exploitability_tier=tier,
+                    analysis_grade=grade.upper() if isinstance(grade, str) else None,
+                    analysis_evidence=evidence.upper() if isinstance(evidence, str) else None,
                     analysis_model=stmt_dict.get("x_firmcore_analysis_model"),
                 )
                 statements.append(stmt)

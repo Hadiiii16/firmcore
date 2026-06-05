@@ -28,10 +28,14 @@ from db import (
     now_iso,
 )
 from event_bus import broadcast
-from pipeline.extractor import ExtractResult, extract_firmware
-from pipeline.sbom import SbomResult, generate_sbom_multi
+from pipeline.emba import run_emba_extract_sbom, run_sbom_post_processing
 from pipeline.scanner import ScanResult, Vulnerability, scan_sbom
 from pipeline.vex import VexResult, VexStatement, analyze_cve_batch
+# Legacy — binwalk + syft 경로.  EMBA 로 교체됐지만 MOCK 모드와 향후 fallback
+# 여지를 위해 import 만 보존.  실제 호출처는 모두 _stage_emba_pipeline 으로
+# 이동했다.
+from pipeline.extractor import ExtractResult, extract_firmware  # noqa: F401
+from pipeline.sbom import SbomResult, generate_sbom_multi  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -414,23 +418,146 @@ async def run_pipeline(job_id: str) -> None:
         "version": job["product_version"] or "unknown",
     }
 
-    # ── Stage 1: 추출 ────────────────────────────────────────────────────
-    extract_result = await _stage_extract(job_id, firmware_path, storage_dir)
-    if extract_result is None:
+    # ── Stage 1 + 2: EMBA 추출 + SBOM + CPE 후처리 (통합) ───────────────
+    # EMBA 가 펌웨어를 직접 추출하고 SBOM 까지 만든 뒤, fix_cpe.py + enrich_sbom.py
+    # 가 CPE 를 보정하여 storage/<job>/sbom.cdx.json 을 생성한다.  EMBA 의 P##
+    # 모듈은 extracting stage, S## 모듈 + 후처리는 sbom_generating stage 로 표시.
+    emba_result = await _stage_emba_pipeline(
+        job_id, firmware_path, storage_dir, product_info=product_info,
+    )
+    if emba_result is None:
         return  # _fail_job already called
-    rootfs_path, rootfs_candidates = extract_result
+    sbom_path, rootfs_path = emba_result
 
-    # ── Stage 2: SBOM 생성 ────────────────────────────────────────────────
-    sbom_path = await _stage_sbom(job_id, rootfs_candidates, storage_dir)
-    if sbom_path is None:
-        return
-
-    # ── Stage 3: CVE 스캔 ────────────────────────────────────────────────
+    # ── Stage 3: CVE 스캔 (grype, 변경 없음) ─────────────────────────────
     scan_result = await _stage_scan(job_id, sbom_path, storage_dir)
     if scan_result is None:
         return
 
-    # ── Stage 4: VEX 분석 ────────────────────────────────────────────────
+    # ── Stage 4: VEX 분석 (Gemini/Codex, 변경 없음) ──────────────────────
+    await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir)
+
+
+# ---------------------------------------------------------------------------
+# Resume-from-SBOM — EMBA 가 만든 sbom.raw.json 이 이미 있을 때 후속 단계만
+# 재실행한다.  EMBA(추출 + SBOM 생성) 가 가장 무거운 단계(수십분~1시간) 인데
+# 여기서 실패하지 않았고 fix_cpe / enrich / grype / VEX 단계에서 깨진 경우,
+# 처음부터 다시 돌리는 비용을 회피한다.
+# ---------------------------------------------------------------------------
+
+
+async def run_from_existing_sbom(job_id: str) -> None:
+    """``storage/<job>/sbom.raw.json`` 에서 시작해 fix_cpe → enrich → grype →
+    VEX 까지 진행한다.
+
+    extracting 단계는 EMBA 결과 디렉토리에서 rootfs_path 만 복구.  EMBA 자체는
+    재실행하지 않는다 (사용 의도: SBOM 만들기 단계는 끝났는데 후처리에서 막혔거나
+    사용자가 후속 단계만 다시 돌리고 싶을 때).
+    """
+    logger.info("[Runner] Resume-from-SBOM 시작: job=%s", job_id)
+
+    async with get_db() as db:
+        job = await db_get_job(db, job_id)
+        if not job:
+            logger.error("[Runner] Job 없음: %s", job_id)
+            return
+
+    storage_dir = Path(job["storage_dir"])
+    sbom_raw = storage_dir / "sbom.raw.json"
+    if not sbom_raw.exists():
+        await _fail_job(
+            job_id, "sbom_generating",
+            f"resume 불가: sbom.raw.json 없음 ({sbom_raw}). EMBA 단계가 끝나지 않았던 잡입니다."
+        )
+        return
+
+    product_info = {
+        "name": job["product_name"] or "firmware",
+        "version": job["product_version"] or "unknown",
+    }
+    # rootfs_path 복원 우선순위:
+    #   1) DB 의 rootfs_path (잡이 sbom_generating 단계까지 끝나 _end_stage 가
+    #      실행됐을 때만 채워짐 — fix_cpe 실패 잡은 보통 비어있음)
+    #   2) storage/<job>/emba_logs/ 에서 _find_emba_rootfs (squashfs-root /
+    #      ubi_extracted/.../rootfs / Linux 시그니처 디렉토리 자동 탐색)
+    rootfs_path: Optional[Path] = None
+    if job.get("rootfs_path"):
+        cand = Path(job["rootfs_path"])
+        if cand.exists():
+            rootfs_path = cand
+    if rootfs_path is None:
+        emba_log_dir = storage_dir / "emba_logs"
+        if emba_log_dir.exists():
+            from pipeline.emba import _find_emba_rootfs
+            try:
+                rootfs_path = _find_emba_rootfs(emba_log_dir)
+            except Exception as exc:
+                logger.warning("[Runner] _find_emba_rootfs 예외: %s", exc)
+            if rootfs_path is None:
+                # 마지막 fallback — emba_logs/firmware 그대로
+                firmware_dir = emba_log_dir / "firmware"
+                if firmware_dir.exists():
+                    rootfs_path = firmware_dir
+            if rootfs_path is not None:
+                logger.info("[Runner] rootfs 복원: %s", rootfs_path)
+
+    sbom_stage = "sbom_generating"
+    t0 = time.monotonic()
+    await _start_stage(job_id, sbom_stage)
+
+    sbom_path: Optional[Path] = None
+    component_count = 0
+    log_count = 0
+    try:
+        async for event in run_sbom_post_processing(
+            sbom_raw, storage_dir,
+            rootfs_path=rootfs_path,
+            emba_log_dir=storage_dir / "emba_logs",
+        ):
+            etype = event.get("type")
+            if etype == "stage_progress":
+                log_count += 1
+                progress = min(90, log_count * 5)
+                await _emit_progress(job_id, sbom_stage, progress, event.get("log", ""))
+            elif etype == "stage_percent":
+                # enrich_sbom tqdm — progress bar 만 갱신, log 미발사
+                pct = int(event.get("progress") or 0)
+                await _emit_progress(job_id, sbom_stage, pct, "")
+            elif etype == "error":
+                msg = event.get("message") or "SBOM 후처리 실패"
+                await _fail_job(job_id, sbom_stage, msg)
+                return
+            elif etype == "emba_pipeline_complete":
+                sbom_path = Path(event["sbom_path"])
+                component_count = int(event.get("component_count") or 0)
+                break
+    except Exception as exc:
+        logger.exception("[Runner] Resume-from-SBOM 예외")
+        await _fail_job(job_id, sbom_stage, f"Resume-from-SBOM 예외: {exc}")
+        return
+
+    if sbom_path is None or not sbom_path.exists():
+        await _fail_job(job_id, sbom_stage, "후처리가 sbom.cdx.json 을 생성하지 못함")
+        return
+
+    elapsed_sbom = time.monotonic() - t0
+    await _end_stage(
+        job_id, sbom_stage, elapsed_sbom,
+        sbom_path=str(sbom_path),
+        component_count=component_count,
+        rootfs_path=str(rootfs_path) if rootfs_path else None,
+    )
+
+    # 이어서 scanning + vex_analyzing
+    scan_result = await _stage_scan(job_id, sbom_path, storage_dir)
+    if scan_result is None:
+        return
+    if rootfs_path is None:
+        await _fail_job(
+            job_id, "vex_analyzing",
+            "rootfs_path 복원 실패 — VEX 분석 불가. 잡을 처음부터 다시 돌려야 합니다."
+        )
+        return
     await _stage_vex(job_id, scan_result, rootfs_path, product_info, storage_dir)
 
 
@@ -439,88 +566,115 @@ async def run_pipeline(job_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _stage_extract(
+async def _stage_emba_pipeline(
     job_id: str,
     firmware_path: Path,
     storage_dir: Path,
-) -> Optional[tuple[Path, list[Path]]]:
-    """추출 성공 시 (대표 rootfs, 모든 후보 목록) 반환."""
-    stage = "extracting"
+    product_info: Optional[dict] = None,
+) -> Optional[tuple[Path, Path]]:
+    """EMBA 추출 + SBOM 생성 + CPE 후처리를 단일 함수로 통합.
+
+    EMBA 한 번의 호출이 펌웨어 추출과 SBOM 생성을 모두 수행하므로 기존의
+    ``_stage_extract`` + ``_stage_sbom`` 두 단계를 함수 하나로 합쳤다.  UI/DB
+    측 단계 표시는 그대로 ``extracting`` → ``sbom_generating`` 두 단계로
+    유지하기 위해 EMBA stdout 의 P##/S## 모듈 마커를 보고 stage 전환 이벤트를
+    적절한 시점에 발사한다.
+
+    반환: (sbom_path, rootfs_path) — 둘 다 절대경로.
+    """
+    extract_stage = "extracting"
+    sbom_stage = "sbom_generating"
     t0 = time.monotonic()
+    extract_started_ts = t0
+    sbom_started_ts: Optional[float] = None
 
-    await _start_stage(job_id, stage)
+    await _start_stage(job_id, extract_stage)
+    current_stage = extract_stage
 
-    extract_dir = storage_dir / "extracted"
-    log_count = 0
-    rootfs: Optional[Path] = None
-    candidates: list[Path] = []
-
-    try:
-        async for item in extract_firmware(firmware_path, extract_dir, job_id):
-            if isinstance(item, str):
-                log_count += 1
-                progress = min(90, log_count * 3)
-                await _emit_progress(job_id, stage, progress, item)
-
-            elif isinstance(item, ExtractResult):
-                if not item.success:
-                    await _fail_job(job_id, stage, item.error or "binwalk 추출 실패")
-                    return None
-                rootfs = item.rootfs_path
-                candidates = item.rootfs_candidates
-
-    except Exception as exc:
-        await _fail_job(job_id, stage, f"추출 단계 예외: {exc}")
-        return None
-
-    if rootfs is None:
-        await _fail_job(job_id, stage, "rootfs를 탐지하지 못했습니다. 펌웨어 구조를 확인하세요.")
-        return None
-
-    elapsed = time.monotonic() - t0
-    await _end_stage(job_id, stage, elapsed, rootfs_path=str(rootfs))
-    return rootfs, candidates or [rootfs]
-
-
-async def _stage_sbom(
-    job_id: str,
-    rootfs_candidates: list[Path],
-    storage_dir: Path,
-) -> Optional[Path]:
-    stage = "sbom_generating"
-    t0 = time.monotonic()
-
-    await _start_stage(job_id, stage)
-
-    log_count = 0
     sbom_path: Optional[Path] = None
+    rootfs_path: Optional[Path] = None
+    emba_log_dir: Optional[Path] = None
     component_count = 0
+    log_count = 0
 
     try:
-        async for item in generate_sbom_multi(rootfs_candidates, storage_dir, job_id):
-            if isinstance(item, str):
-                log_count += 1
-                progress = min(90, log_count * 5)
-                await _emit_progress(job_id, stage, progress, item)
+        async for event in run_emba_extract_sbom(
+            firmware_path, storage_dir, job_id, product_info=product_info,
+        ):
+            etype = event.get("type")
 
-            elif isinstance(item, SbomResult):
-                if not item.success:
-                    await _fail_job(job_id, stage, item.error or "SBOM 생성 실패")
-                    return None
-                sbom_path = item.sbom_path
-                component_count = item.component_count
+            if etype == "stage_transition":
+                # EMBA 가 P 모듈 → S 모듈 로 전환 = extracting 완료 + sbom_generating 시작
+                if event.get("from") == "extracting" and current_stage == extract_stage:
+                    elapsed = time.monotonic() - extract_started_ts
+                    await _end_stage(job_id, extract_stage, elapsed)
+                    await _start_stage(job_id, sbom_stage)
+                    current_stage = sbom_stage
+                    sbom_started_ts = time.monotonic()
+                continue
+
+            if etype == "stage_progress":
+                log_count += 1
+                progress = min(90, log_count * 2)
+                # event 안의 stage 가 아닌 실제 current_stage 로 emit
+                # (run_emba 가 보낸 stage 와 일치하지만 안전 가드)
+                await _emit_progress(job_id, current_stage, progress, event.get("log", ""))
+                continue
+
+            if etype == "stage_percent":
+                # enrich_sbom 의 tqdm progress — PipelineStepper 의 progress bar
+                # 만 갱신하고 log 는 미발사 (사용자 화면에 update 마다 한 줄씩
+                # 누적되는 노이즈 차단).
+                pct = int(event.get("progress") or 0)
+                await _emit_progress(job_id, current_stage, pct, "")
+                continue
+
+            if etype == "error":
+                msg = event.get("message") or "EMBA 파이프라인 실패"
+                await _fail_job(job_id, current_stage, msg)
+                return None
+
+            if etype == "emba_pipeline_complete":
+                sbom_path = Path(event["sbom_path"])
+                rootfs_str = event.get("rootfs_path")
+                rootfs_path = Path(rootfs_str) if rootfs_str else None
+                emba_log_dir_str = event.get("emba_log_dir")
+                emba_log_dir = Path(emba_log_dir_str) if emba_log_dir_str else None
+                component_count = int(event.get("component_count") or 0)
+                break
 
     except Exception as exc:
-        await _fail_job(job_id, stage, f"SBOM 단계 예외: {exc}")
+        logger.exception("[Runner] EMBA 파이프라인 예외")
+        await _fail_job(job_id, current_stage, f"EMBA 파이프라인 예외: {exc}")
         return None
 
-    elapsed = time.monotonic() - t0
+    if sbom_path is None or not sbom_path.exists():
+        await _fail_job(job_id, current_stage, "EMBA 파이프라인이 sbom.cdx.json 을 생성하지 못함")
+        return None
+
+    if rootfs_path is None:
+        # EMBA 가 SBOM 은 만들었으나 squashfs-root 후보를 못 찾은 케이스.
+        # 추출 결과 디렉토리(emba_log_dir/firmware) 자체를 rootfs 로 fallback —
+        # VEX 분석 시 정확도가 떨어지지만 SBOM/CVE 스캔까지는 진행 가능.
+        # emba_log_dir 은 product 기반 leaf 이름이라 emba.py 에서 받아온 값을 사용.
+        fallback_root = (emba_log_dir / "firmware") if emba_log_dir else None
+        if fallback_root and fallback_root.exists():
+            rootfs_path = fallback_root
+            logger.warning("[Runner] rootfs 미식별 — fallback to %s", fallback_root)
+        else:
+            await _fail_job(job_id, sbom_stage, "EMBA 추출 결과에서 rootfs 후보를 찾지 못함")
+            return None
+
+    # sbom_generating 단계 종료 (DB column 업데이트)
+    elapsed_sbom = time.monotonic() - (sbom_started_ts or extract_started_ts)
     await _end_stage(
-        job_id, stage, elapsed,
+        job_id, sbom_stage, elapsed_sbom,
         sbom_path=str(sbom_path),
         component_count=component_count,
+        rootfs_path=str(rootfs_path),
     )
-    return sbom_path
+
+    return sbom_path, rootfs_path
 
 
 async def _stage_scan(
@@ -693,8 +847,11 @@ async def _stage_vex(
                             (stmt.report_text or stmt.impact_statement)
                             if stmt else None
                         ),
-                        "exploitability_tier": (
-                            stmt.exploitability_tier if stmt else None
+                        "analysis_grade": (
+                            stmt.analysis_grade if stmt else None
+                        ),
+                        "analysis_evidence": (
+                            stmt.analysis_evidence if stmt else None
                         ),
                         "analysis_model": (
                             stmt.analysis_model if stmt else None

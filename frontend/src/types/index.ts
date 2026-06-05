@@ -66,6 +66,7 @@ export interface SbomComponent {
   licenses: string[]
   cve_count: number
   max_severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN' | null
+  severity_counts: Partial<Record<'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN', number>>
 }
 
 export interface CveResult {
@@ -86,15 +87,22 @@ export interface CveResult {
   vex_status: string | null
   vex_justification: string | null
   vex_detail: string | null
-  // Custom FirmCore tier when vex_status === 'affected':
-  //   'low'      — compile-time mitigations sufficiently cover the CVE's
-  //                 primary attack class; patch priority can be deferred.
-  //   'standard' — default affected (urgent patch).
-  //   null       — tier is only meaningful for affected statuses.
-  exploitability_tier: 'low' | 'standard' | null
-  // Actual Gemini model that produced this VEX verdict.  May differ from
-  // the batch default when Pro 쿼터 소진 → Flash auto-fallback.  Null for
-  // legacy records analysed before tracking was added.
+  // GEMINI.md v5.0 — affected 의 위험 등급.
+  //   'B' — 일반 affected (도달 가능 + 완화 부족) → 패치 시급
+  //   'C' — 도달 가능하지만 컴파일 완화로 exploit 난이도 상승
+  //   'D' — 코드 + 실행 경로 존재하나 공격 표면 노출 증거 없음 (잠재 위험)
+  //   'A' — exploit 시연 (GEMINI.md 가 발행 금지하지만 잘못 들어올 수 있어 보존)
+  //   null — status !== 'affected'
+  analysis_grade: 'A' | 'B' | 'C' | 'D' | null
+  // GEMINI.md v5.0 — 정적 분석 신뢰도 (모든 status 에 적용).
+  //   HIGH   — 직접 증거로 판정
+  //   MEDIUM — 합리적 추론, 일부 가정 포함
+  //   LOW    — 강한 가정 또는 stripped/NVRAM 의존
+  //   null   — evidence 태그 누락 (구버전 분석본)
+  analysis_evidence: 'HIGH' | 'MEDIUM' | 'LOW' | null
+  // 실제 분석을 수행한 모델명 (Gemini Pro/Flash 또는 Codex).  Pro 쿼터
+  // 소진 시 Codex / Flash 로 자동 폴백되는 케이스가 있어 배치 기본 모델과
+  // 다를 수 있다.  null = 모델 추적 전 데이터 또는 mock.
   analysis_model: string | null
 }
 
@@ -191,4 +199,8 @@ export interface JobResult {
   created_at: string
   completed_at: string | null
   error_message: string | null
+
+  // EMBA 가 만든 sbom.raw.json 이 디스크에 있으면 true.  fix_cpe/enrich/grype/
+  // VEX 단계에서 잡이 깨졌을 때 "Resume from SBOM" 버튼을 활성화할지 결정.
+  resume_from_sbom_available?: boolean
 }

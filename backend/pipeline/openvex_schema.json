@@ -51,7 +51,8 @@
           "justification":    { "type": "string" },
           "impact_statement": { "type": "string" },
           "action_statement": { "type": "string" },
-          "x_firmcore_exploitability_tier": { "enum": ["low", "standard", null] },
+          "x_firmcore_grade":               { "enum": ["A", "B", "C", "D", null] },
+          "x_firmcore_evidence":            { "enum": ["HIGH", "MEDIUM", "LOW", null] },
           "x_firmcore_analysis_model":      { "type": "string" },
           "x_firmcore_report_md": {
             "type": "string",

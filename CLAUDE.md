@@ -9,11 +9,11 @@ FirmCore는 펌웨어 이미지를 업로드하면 자동으로 rootfs를 추출
 ## 실행 명령
 
 ```bash
-# 전체 서버 시작 (백엔드 :8080 + 프론트엔드 :5173)
+# 전체 서버 시작 (백엔드 :8000 + 프론트엔드 :5173)
 ./start.sh
 
 # 옵션
-./start.sh --mock           # MOCK 모드 (binwalk/grype/Gemini 없이 더미 데이터)
+./start.sh --mock           # MOCK 모드 (EMBA/grype/Gemini 없이 더미 데이터)
 ./start.sh --backend-only
 ./start.sh --frontend-only
 
@@ -25,7 +25,7 @@ FIRMCORE_RELOAD=1 ./start.sh
 # 백엔드 단독 실행 (개발)
 cd backend
 source .venv/bin/activate
-uvicorn main:app --host 0.0.0.0 --port 8080
+uvicorn main:app --host 0.0.0.0 --port 8000
 
 # 프론트엔드 단독 실행 (개발)
 cd frontend
@@ -50,8 +50,10 @@ python3 -m scripts.restore_vex_from_events <JOB_ID>
 
 ```
 펌웨어 업로드
-    → [1] extracting      binwalk -e -M → rootfs 탐지 (squashfs / UBI / JFFS2 자동)
-    → [2] sbom_generating sbom_claude_scripts (syft 기반) → CycloneDX SBOM
+    → [1] extracting      EMBA (Ubuntu WSL native, docker 모드, P 모듈) → 펌웨어 추출 + rootfs 식별
+    → [2] sbom_generating EMBA (S 모듈) → CycloneDX SBOM
+                          → fix_cpe.py (JSON repair + cpe 13-field 정규화)
+                          → enrich_sbom.py (NVD CPE Top-1 결정 + 3 properties)
     → [3] scanning        grype → scan.json (CVE 목록)
     → [4] vex_analyzing   Gemini CLI --yolo (PTY) → OpenVEX JSON + 분석 보고서
 ```
@@ -143,14 +145,14 @@ for ci_var in ("CI", "GITHUB_ACTIONS", "BUILDKITE"):
 
 `-p` 를 쓰면 Ink rich UI 가 꺼져 Shell 도구 박스가 사라지므로 대신 **PTY master fd 로 `\r\n` 을 자동 전송** 합니다 (`_read_pty` 의 initial prompt auto-submit). prefill `> {cve_id}` 가 viewport 에 보이면 감지 즉시 Enter 전송, 20초 fallback 타이머도 있습니다.
 
-Gemini가 내장 Shell 도구로 `find`, `nm`, `readelf`, `strings`, `grep` 등을 rootfs 에서 직접 실행하며 **4단계 도달성·완화 분석**을 수행합니다:
+Gemini/Codex 가 내장 Shell 도구로 `find`, `nm`, `readelf`, `strings`, `grep`, `objdump` 등을 rootfs 에서 직접 실행하며 **4단계 도달성·완화 분석**을 수행합니다:
 
-1. **Library Level** — 취약 심볼 존재 + 버전 범위 확인 (`vulnerable_code_not_present` / `fixed`)
+1. **Library Level** — 취약 심볼 존재 + 버전 범위 확인 (`vulnerable_code_not_present`)
 2. **Binary Level** — 취약 함수를 호출/링크하는 ELF 탐색 (`vulnerable_code_not_in_execute_path`)
-3. **Attack Surface** — 원격 공격자 도달성: 리스너 심볼, auto-start, Web/CGI, SUID, CVE 전제 매칭 (`vulnerable_code_cannot_be_controlled_by_adversary`)
-4. **Mitigation Check** — 컴파일 완화(PIE/NX/RELRO/Canary/FORTIFY) 가 CVE 공격 유형을 실질 차단하는지 → `exploitability_tier` 결정
+3. **Attack Surface** — 원격 공격자 도달성: 리스너 심볼, auto-start, Web/CGI, SUID, CVE 전제 매칭
+4. **Mitigation Check** — 컴파일 완화(PIE/NX/RELRO/Canary/FORTIFY) 가 CVE 공격 유형을 실질 차단하는지 → `GRADE` 결정
 
-`~/.gemini/GEMINI.md`가 전역 시스템 프롬프트로 자동 로드됩니다 (v4.0 — Attack-Surface + Mitigation Model). CLI 인자에는 `@filepath` 구문이 작동하지 않으므로 프롬프트 파일 내용을 직접 삽입하지 않고, task-specific 맥락만 인자로 전달합니다.
+`~/.gemini/GEMINI.md` (v5.0+) 가 전역 시스템 프롬프트로 자동 로드됩니다. CLI 인자에는 `@filepath` 구문이 작동하지 않으므로 프롬프트 파일 내용을 직접 삽입하지 않고, task-specific 맥락만 인자로 전달합니다.
 
 #### CVE 메타데이터 프롬프트 주입 (GoogleSearch 방지)
 
@@ -158,16 +160,34 @@ Gemini가 내장 Shell 도구로 `find`, `nm`, `readelf`, `strings`, `grep` 등�
 
 description 은 기본 **무제한** (`VEX_DESC_MAX_CHARS=0`). 실 데이터 기준(1240 CVE 표본) median 158자, max ~3900자 — Gemini context window 대비 미미하고, 잘리면 Gemini 가 GoogleSearch 한 번을 더 호출해 오히려 쿼터가 더 든다. 특정 API per-request 한도에 걸리면 환경변수로 조절.
 
-#### Exploitability Tier (affected 의 서브 카테고리)
+#### GRADE 시스템 (affected 의 위험 등급) — GEMINI.md v5.0
 
-4단계 Mitigation Check 는 `affected` status 를 뒤집지 않습니다. OpenVEX status 는 그대로 두되 커스텀 확장 `exploitability_tier` 를 부여:
+`affected` status 는 그대로 두되, OpenVEX 확장 필드 `x_firmcore_grade` 로 등급을 세분화합니다. (이전 `exploitability_tier` 는 v5.0 부터 완전히 폐기.)
 
-- **`standard`** — 일반 affected (시급 패치)
-- **`low`** — CVE 공격 유형에 매칭되는 컴파일 완화 **전부 충족** (예: Stack BOF + Canary+NX+PIE 모두 O). 실전 exploit 난이도가 높아 패치 우선순위 하향 가능
+| GRADE | 의미 | 색상 |
+|-------|------|------|
+| **B** | 일반 affected — 도달 가능 + 완화 부족. 패치 시급. | 빨강 |
+| **C** | 도달 가능하지만 컴파일 완화(NX/PIE/Canary 등) 가 CVE 공격 유형을 실질 차단해 exploit 난이도 상승 | 주황 |
+| **D** | 코드 + 실행 경로 존재하나 공격 표면 노출 증거 없음 (잠재 위험) | 노랑 |
+| **A** | exploit 시연 — 본 에이전트는 **발행 금지** (잘못 들어오면 배지로 표시) | 진한 빨강 |
 
-Tier 적용 조건은 엄격 — Heap BOF / UAF / Logic bypass 류는 **컴파일 완화로 무효화 불가** 이므로 `low` 부여 금지. OpenVEX JSON 의 `impact_statement` 는 `[EXPLOITABILITY_TIER: LOW|STANDARD|NONE]` prefix 로 시작하고, `combined_vex.json` 에는 `x_firmcore_exploitability_tier` 확장 필드로 영속화됩니다.
+GRADE 가 다음 조건을 모두 충족해야 C 가 부여됩니다 (Stack BOF 기준): Canary + NX + PIE 모두 O. Heap BOF / UAF / Logic bypass / Auth bypass / Cmd injection 류는 **컴파일 완화로 무효화 불가** 이므로 항상 GRADE B.
 
-프론트엔드 `VexBadge` 는 tier=low 일 때 `AFFECTED · LOW` (주황) 로, 그 외는 `AFFECTED` (빨강) 로 구분 표시.
+`impact_statement` 는 `[EVIDENCE: HIGH|MEDIUM|LOW] [GRADE: B|C|D]` prefix 로 시작하고, `combined_vex.json` 에는 `x_firmcore_grade` + `x_firmcore_evidence` 확장 필드로 영속화됩니다.
+
+#### Evidence Confidence (모든 status 에 적용)
+
+정적 분석 신뢰도. 모든 판정에 `[EVIDENCE: HIGH|MEDIUM|LOW]` 태그를 의무화:
+
+- **HIGH** — 직접 증거 (dynsym T 검출, PLT/UND 확인, init/systemd 자동 기동 등)
+- **MEDIUM** — 합리적 추론 + 일부 가정 (UND 만 보고 호출자 인정, 영역 strings 다수로 빌드 추정)
+- **LOW** — 강한 가정 또는 stripped/internal 함수 / NVRAM 의존 / cross-arch disassembly 실패 등
+
+프론트엔드 `EvidenceBadge` 는 LOW 와 MEDIUM 만 명시 표시 (HIGH 는 노이즈 줄이기 위해 숨김). LOW 는 사용자가 수동 확인을 우선해야 한다는 신호입니다.
+
+프론트엔드 `VexBadge` 는 GRADE 별로 구분 표시:
+- `AFFECTED · B` (빨강) / `AFFECTED · C` (주황) / `AFFECTED · D` (노랑)
+- Grade 누락 legacy 데이터는 `AFFECTED` (빨강) 로 fallback
 
 #### PTY 출력 스트리밍 (pyte 가상 터미널 → 스크롤백 + 증분 방출)
 
@@ -245,13 +265,18 @@ Gemini 의 OpenVEX `@id` UUID 는 GEMINI.md 에서 **직접 작성한 v4 문자�
 ```
 storage/{job_id}/
 ├── firmware.img              # 원본 업로드 파일
-├── extracted/                # binwalk 추출 결과 (rootfs 포함)
+├── sbom.raw.json             # EMBA 원본 SBOM (디버그용 보존)
+├── sbom.fix.json             # fix_cpe.py 출력 (JSON repair + cpe 정규화)
+├── sbom.cdx.audit.json       # enrich_sbom.py 의 Top-10 후보 진단 정보
+├── cpe_mapper.log            # enrich_sbom.py 실행 trace
+# 실제 추출 결과 (rootfs 포함) 는 storage/<job>/emba_logs/ 에 직접 떨어진다.
+# EMBA 가 Ubuntu WSL native 라 9P 통과 / Kali 와 sync 같은 중간 단계 없음.
 ├── sbom.cdx.json             # CycloneDX SBOM
 ├── scan.json                 # grype 원본 출력
 ├── combined_vex.json         # 전체 CVE VEX 문서 (배치 완료 후 생성 / 재빌드)
 └── vex/
     ├── {CVE-ID}_vex.json        # CVE별 OpenVEX JSON (CVE 완료 시 즉시 생성)
-    │                            # x_firmcore_exploitability_tier 확장 필드 포함
+    │                            # x_firmcore_grade + x_firmcore_evidence 확장 필드 포함
     ├── {CVE-ID}_report.md       # CVE별 AI 분석 요약 보고서
     ├── {CVE-ID}_gemini_yolo.md  # Gemini 전체 응답 원문 (디버깅용)
     └── {CVE-ID}_pty_raw.log     # PTY 원시 출력 (ANSI 포함, 디버깅용)
@@ -265,7 +290,7 @@ storage/{job_id}/
 
 SQLite (`data/firmcore.db`). `get_db()` 비동기 컨텍스트 매니저. 주요 테이블:
 - `jobs` — job 메타데이터 및 집계. **`affected_count` 등 집계 컬럼은 이제 authoritative 가 아님** — UI 표시는 실시간 재집계(위)를 사용하고 DB 캐시는 fallback 역할만.
-- `job_events` — 파이프라인 이벤트 로그 (SSE 스트리밍의 원본 데이터). **VEX 복구의 source of truth** — `cve_done` 이벤트의 `cve_result` payload 에 CVE 별 전체 VEX 결과(vex_status, justification, vex_detail 30KB+, exploitability_tier) 가 영구 보관됨
+- `job_events` — 파이프라인 이벤트 로그 (SSE 스트리밍의 원본 데이터). **VEX 복구의 source of truth** — `cve_done` 이벤트의 `cve_result` payload 에 CVE 별 전체 VEX 결과(vex_status, justification, vex_detail 30KB+, analysis_grade, analysis_evidence, analysis_model) 가 영구 보관됨
 - `stage_timings` — 단계별 경과 시간
 
 ### 프론트엔드
@@ -283,7 +308,7 @@ React + Vite + Tailwind. 핵심 훅:
 
 **LIVE VEX 뱃지** ([Badge.tsx](frontend/src/components/Badge.tsx)): `status === 'vex_analyzing'` 일 때 초록색 깜빡이는 점 + `LIVE VEX` 표시 (이전 `VEX AI` 라벨 대체).
 
-**타입 정합성 주의**: `frontend/src/types/index.ts`의 필드명은 백엔드 Pydantic 모델(`backend/models/job.py`)과 정확히 일치해야 합니다. 예: `fix_version`, `JobResult.id`, `exploitability_tier`.
+**타입 정합성 주의**: `frontend/src/types/index.ts`의 필드명은 백엔드 Pydantic 모델(`backend/models/job.py`)과 정확히 일치해야 합니다. 예: `fix_version`, `JobResult.id`, `analysis_grade`, `analysis_evidence`, `analysis_model`.
 
 ### 정렬 규칙 — 백엔드/프론트 일치
 
@@ -310,14 +335,21 @@ Resume from here 의 삭제 대상 CVE 가 화면과 어긋나지 않으려면 *
 | `CODEX_REASONING_EFFORT` | (비움 → `~/.codex/config.toml` 상속, 보통 medium) | 허용: `minimal` / `low` / `medium` / `high` / `xhigh`. 설정 시 `-c model_reasoning_effort=<value>` 로 주입해 per-job 오버라이드. `high` 이상은 응답 시간 · 쿼터 사용이 대폭 증가하므로 중요 CVE 만 고려 |
 | `CODEX_REASONING_SUMMARY` | (비움 → config.toml 상속) | 허용: `auto` / `concise` / `detailed` / `none`. `detailed` 면 Codex 가 사고 과정 요약을 더 자주 방출해 로그가 verbose |
 | `VEX_GEMINI_TIMEOUT` | `1800` | CVE 하나당 Gemini CLI 타임아웃 (초, 30분) |
-| `VEX_GEMINI_IDLE_SHUTDOWN` | `45` | PTY 출력이 시작된 뒤 idle 지속 시 강제 종료 임계치 (초) |
+| `VEX_GEMINI_IDLE_SHUTDOWN` | `120` | PTY 출력이 시작된 뒤 idle 지속 시 강제 종료 임계치 (초). v5.0 GEMINI.md 의 4단계 분석 + objdump xref 보강 등 무거운 turn 이 늘어나 45→120 으로 상향. 너무 짧으면 응답 중간에 끊겨 OpenVEX JSON 추출 실패 + under_investigation 폴백이 잦아짐 |
 | `VEX_PTY_COLUMNS` / `VEX_PTY_LINES` | `200` / `80` | PTY/pyte viewport 크기. 200 cols 는 긴 grep 결과가 Shell 박스 안에서 wrap 되지 않도록 충분한 폭 |
 | `VEX_PTY_UI_TAIL_LINES` | `4` | 증분 뷰포트 방출 시 Ink 임시 UI 영역으로 간주할 바닥 라인 수 |
 | `VEX_EMIT_HASH_WINDOW` | `2000` | 증분 뷰포트 방출의 내용-해시 중복 필터가 유지할 최근 라인 수 |
 | `VEX_DESC_MAX_CHARS` | `0` (무제한) | Gemini 프롬프트에 포함할 CVE description 최대 길이. 0=무제한 (권장). 잘리면 Gemini 가 GoogleSearch 로 재조회하는 비용이 더 큼 |
 | `VEX_CVE_DELAY` | `5` | CVE 간 딜레이 (Gemini rate limit 방지, 초) |
 | `STORAGE_DIR` | `./storage` | 분석 결과 저장 경로 |
-| `SBOM_BIN` | `./sbom_claude_scripts` | SBOM 생성 바이너리 경로 |
+| `EMBA_BIN` | `/home/ktdevice/work/emba/emba` | EMBA 실행 파일 (Ubuntu WSL 안에 설치) |
+| `EMBA_PROFILE` | `binxray-sbom` | EMBA scan profile. `quick-sbom` 기반에서 S24/S25 제거한 SBOM-only 최소 모듈 셋 (`SELECT_MODULES=( "S06" "S08" "F15" )`). default-sbom 의 QEMULATION=1 (느림) + S24 의 host uid mismatch tee 권한 에러 회피 |
+| `EMBA_TIMEOUT` | `7200` | EMBA wall-clock timeout (초, 2시간) |
+| `FIX_CPE_BIN` | `/home/ktdevice/fix_cpe.py` | EMBA SBOM 의 cpe 13-field 1차 정규화 스크립트 |
+| `CPE_MAPPER_DIR` | `/home/ktdevice/cpe_mapper` | enrich_sbom.py 가 있는 디렉토리 (cwd 고정) |
+| `CPE_MAPPER_PYTHON` | `/home/ktdevice/cpe_mapper/.venv/bin/python` | enrich_sbom.py 실행에 쓸 venv python |
+| `CPE_MAPPER_BACKEND` | `deterministic` | NVD CPE Top-1 결정 백엔드 — `deterministic` / `gemini` / `codex` |
+| `CPE_MAPPER_TIMEOUT` | `1800` | enrich_sbom.py wall-clock timeout (초) |
 
 더 이상 사용하지 않는 환경변수:
 - `VEX_GEMINI_OUTPUT_FORMAT` — PTY 모드에서는 `--output-format` 을 주지 않습니다.
@@ -326,12 +358,15 @@ Resume from here 의 삭제 대상 CVE 가 화면과 어긋나지 않으려면 *
 
 ## 사전 요구사항
 
-- **binwalk** — 펌웨어 추출
+- **EMBA (Ubuntu WSL native, docker 모드)** — `~/work/emba/emba` (`installer.sh -d` 로 설치). `default-sbom` 프로파일로 호출. **사용자는 `docker` 그룹 멤버여야 sudo 없이 동작** (EMBA wrapper 가 그 조건일 때만 root 체크를 자동 우회). 그룹 추가: `sudo usermod -aG docker $USER && newgrp docker`
+- **fix_cpe.py** (`/home/ktdevice/fix_cpe.py`) — EMBA SBOM 의 JSON repair + cpe 13-field 1차 정규화 (`json-repair` 의존)
+- **cpe_mapper 프로젝트** (`/home/ktdevice/cpe_mapper/`) — `enrich_sbom.py` + 자체 venv + NVD CPE 사전 SQLite DB. EMBA SBOM 에 Top-1 NVD CPE 결정 + 3 properties 병기
+- **docker daemon** — EMBA 가 컨테이너 안에서 분석 수행. `docker info` 가 응답해야 함
 - **grype** — CVE 스캔
 - **Gemini CLI** v0.38.2+ (`npm install -g @google/gemini-cli`) — Google 계정 OAuth 로 인증 (`gemini` 한 번 실행해 로그인)
 - **OpenAI Codex CLI** v0.122+ (`npm install -g @openai/codex` 또는 공식 설치 방법) — ChatGPT Pro/Plus OAuth 로 인증 (`codex login` 한 번). Auto 폴백 체인의 중간 단계이므로 필수.
-- **sbom_claude_scripts** — 프로젝트 루트에 바이너리 배치
-- **`~/.gemini/GEMINI.md`** (v4.0) — Gemini VEX 분석 시스템 프롬프트. Attack-Surface + Mitigation 4단계 모델, exploitability_tier 부여 규칙, WriteFile 경로 규약 등 포함. gemini CLI 가 어느 디렉토리에서 실행되든 자동 로드됩니다.
+- ~~**sbom_claude_scripts**~~ (legacy syft 기반, EMBA 로 대체됨. 코드 import 만 보존)
+- **`~/.gemini/GEMINI.md`** (v5.0+) — Gemini VEX 분석 시스템 프롬프트. Attack-Surface + Mitigation 4단계 모델, GRADE B/C/D 부여 규칙, Evidence Confidence(HIGH/MEDIUM/LOW), WriteFile 경로 규약 등 포함. gemini CLI 가 어느 디렉토리에서 실행되든 자동 로드됩니다.
 - **`~/.codex/AGENTS.md`** — Codex 용 시스템 프롬프트. GEMINI.md 와 **내용 자체는 거의 동일** 해도 무방합니다 — Codex 어댑터가 프롬프트 끝에 "WriteFile 금지 / 최종 응답은 OpenVEX JSON" override 를 자동 주입하므로 GEMINI.md 의 WriteFile 섹션을 굳이 삭제할 필요는 없습니다. 간단한 배치:
   ```bash
   cp ~/.gemini/GEMINI.md ~/.codex/AGENTS.md
@@ -387,7 +422,7 @@ Gemini 가 응답을 완성하기 전에 프로세스가 종료되면 JSON 이 �
 
 ### VEX 결과 복구 — DB 가 truth
 
-Resume from here 를 잘못 누르거나 Retry 를 반복하다 `vex/` 디렉토리의 _vex.json 파일이 의도치 않게 삭제될 수 있습니다. **DB `job_events` 테이블의 `cve_done` 이벤트는 `cve_result` payload 에 vex_status / justification / vex_detail(보고서 30KB+) / exploitability_tier 를 전부 담고 있어** source of truth 역할을 합니다. 디스크에서 지워져도 다음 스크립트로 복구:
+Resume from here 를 잘못 누르거나 Retry 를 반복하다 `vex/` 디렉토리의 _vex.json 파일이 의도치 않게 삭제될 수 있습니다. **DB `job_events` 테이블의 `cve_done` 이벤트는 `cve_result` payload 에 vex_status / justification / vex_detail(보고서 30KB+) / analysis_grade / analysis_evidence / analysis_model 를 전부 담고 있어** source of truth 역할을 합니다. 디스크에서 지워져도 다음 스크립트로 복구:
 
 ```bash
 cd backend && source .venv/bin/activate

@@ -65,30 +65,47 @@ export function SeverityBadge({ severity }: { severity: Severity }) {
 }
 
 // ── VexBadge ──────────────────────────────────────────────────────────────────
+// GEMINI.md v5.0 — affected 는 GRADE B/C/D 로 세분화.  색상은 위험도 우선순위:
+//   B (가장 시급)  — 빨강
+//   C (완화 충족)  — 주황
+//   D (잠재 위험)  — 호박색(amber)
+// 그 외 status (not_affected / fixed / under_investigation) 는 단일 색상.
 
-const VEX_STYLES: Record<string, string> = {
+const VEX_BASE_STYLES: Record<string, string> = {
   not_affected:        'bg-green-900/60 text-accent-green border border-green-700/40',
-  // affected + low:  orange (not-red, signalling reduced urgency)
-  affected_low:        'bg-orange-900/60 text-orange-300 border border-orange-700/40',
-  affected:            'bg-red-900/60 text-red-300 border border-red-700/40',
   fixed:               'bg-blue-900/60 text-blue-300 border border-blue-700/40',
   under_investigation: 'bg-amber-900/60 text-amber-300 border border-amber-700/40',
+  affected_b:          'bg-red-900/60 text-red-300 border border-red-700/40',
+  affected_c:          'bg-orange-900/60 text-orange-300 border border-orange-700/40',
+  affected_d:          'bg-yellow-900/40 text-yellow-200 border border-yellow-700/40',
+  affected_a:          'bg-red-950/80 text-red-100 border border-red-500',
+  affected:            'bg-red-900/60 text-red-300 border border-red-700/40', // grade unknown
 }
 
 const VEX_LABELS: Record<string, string> = {
   not_affected:        'NOT AFFECTED',
-  affected_low:        'AFFECTED · LOW',
-  affected:            'AFFECTED',
   fixed:               'FIXED',
   under_investigation: 'INVESTIGATING',
+  affected_b:          'AFFECTED · B',
+  affected_c:          'AFFECTED · C',
+  affected_d:          'AFFECTED · D',
+  affected_a:          'AFFECTED · A',
+  affected:            'AFFECTED',
+}
+
+const GRADE_TITLES: Record<string, string> = {
+  B: '일반 affected — 도달 가능 + 완화 부족. 패치 시급.',
+  C: '도달 가능하지만 컴파일 완화(NX/PIE/Canary 등)로 exploit 난이도 상승.',
+  D: '코드와 실행 경로는 있으나 공격 표면 노출 증거 없음. 잠재 위험.',
+  A: 'exploit 시연 — GEMINI.md 는 이 등급 발행을 금지하지만 결과에 들어옴.',
 }
 
 export function VexBadge({
   status,
-  tier,
+  grade,
 }: {
   status: string | null
-  tier?: 'low' | 'standard' | null
+  grade?: string | null
 }) {
   if (!status) {
     return (
@@ -97,18 +114,58 @@ export function VexBadge({
       </span>
     )
   }
-  // Affected + low-tier gets its own styling so users immediately see the
-  // reduced urgency without having to open the analysis detail.
-  const key = status === 'affected' && tier === 'low' ? 'affected_low' : status
-  const style = VEX_STYLES[key] ?? 'bg-surface-600 text-gray-400'
+  let key = status
+  let titleHint: string | undefined
+  if (status === 'affected') {
+    const g = (grade || '').toUpperCase()
+    if (g === 'A' || g === 'B' || g === 'C' || g === 'D') {
+      key = `affected_${g.toLowerCase()}`
+      titleHint = GRADE_TITLES[g]
+    }
+  }
+  const style = VEX_BASE_STYLES[key] ?? 'bg-surface-600 text-gray-400'
   const label = VEX_LABELS[key] ?? status.toUpperCase()
   return (
     <span
       className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-semibold ${style}`}
+      title={titleHint}
+    >
+      {label}
+    </span>
+  )
+}
+
+// ── EvidenceBadge ────────────────────────────────────────────────────────────
+// 분석 신뢰도 (HIGH / MEDIUM / LOW) 를 작은 보조 배지로.  HIGH 는 기본 상태라
+// 시각적 노이즈 줄이려고 노출하지 않고, MEDIUM / LOW 만 명시 표시한다.
+
+const EVIDENCE_STYLES: Record<string, string> = {
+  HIGH:   'bg-emerald-900/30 text-emerald-300 border border-emerald-700/30',
+  MEDIUM: 'bg-yellow-900/30 text-yellow-300 border border-yellow-700/30',
+  LOW:    'bg-rose-900/40 text-rose-300 border border-rose-700/40',
+}
+
+export function EvidenceBadge({
+  evidence,
+  showHigh = false,
+}: {
+  evidence: string | null | undefined
+  showHigh?: boolean
+}) {
+  if (!evidence) return null
+  const e = evidence.toUpperCase()
+  if (e === 'HIGH' && !showHigh) return null
+  const style = EVIDENCE_STYLES[e] ?? 'bg-surface-700 text-gray-400 border border-surface-500'
+  const label = `EV·${e === 'MEDIUM' ? 'MED' : e}`
+  return (
+    <span
+      className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold tracking-wider ${style}`}
       title={
-        key === 'affected_low'
-          ? '컴파일 완화로 exploit 난이도가 높아 패치 우선순위를 낮출 수 있음'
-          : undefined
+        e === 'HIGH'
+          ? '직접 증거로 판정 — 신뢰도 높음'
+          : e === 'MEDIUM'
+          ? '합리적 추론 + 일부 가정 — 수동 확인 권장'
+          : 'stripped binary / NVRAM / dlopen 모호성 등으로 정적 분석 한계. 수동 검증 필요.'
       }
     >
       {label}

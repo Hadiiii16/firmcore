@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { cancelVex, createJobStream, getJobResult, resumeVex, resumeVexFrom, retryVex, retryVexSingle } from '../api/client'
+import { cancelVex, createJobStream, getJobResult, resumeFromSbom, resumeVex, resumeVexFrom, retryVex, retryVexSingle } from '../api/client'
 import type { CveResult, JobResult, JobStatus } from '../types'
 
 // 백엔드 SSE 실제 포맷
@@ -80,6 +80,10 @@ export function useJobDetail(jobId: string) {
   // in-flight guard + 완료 후 잠깐의 coalesce 창을 두어 중복 호출을
   // 한 건으로 압축한다.
   const loadingRef = useRef(false)
+  // cve_done 직후 SSE patch 누락 방어용 debounce 타이머.  여러 CVE 가
+  // 짧은 간격으로 완료될 때 매번 fetch 하지 않고 "마지막 cve_done 후
+  // 1.5s 동안 추가 이벤트가 없으면" 한 번만 ``/result`` 를 다시 읽는다.
+  const cveDoneRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const loadResult = useCallback(async () => {
     if (loadingRef.current) return
     loadingRef.current = true
@@ -134,6 +138,32 @@ export function useJobDetail(jobId: string) {
       setState((s) => ({
         ...s,
         retrying: false,
+        errorMessage: (err as Error).message,
+      }))
+    }
+  }, [jobId])
+
+  // EMBA 가 만든 sbom.raw.json 에서 fix_cpe → enrich → grype → VEX 까지
+  // 이어 진행.  EMBA(20~60분짜리 무거운 단계) 를 다시 돌리지 않고 후속만.
+  const handleResumeFromSbom = useCallback(async () => {
+    setState((s) => ({ ...s, resuming: true }))
+    try {
+      await resumeFromSbom(jobId)
+      setState((s) => ({
+        ...s,
+        resuming: false,
+        streaming: true,
+        status: 'sbom_generating' as JobStatus,
+        errorMessage: null,
+        currentStage: 'sbom_generating',
+        stageProgress: 0,
+        logs: [],
+      }))
+      setReconnectKey((k) => k + 1)
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        resuming: false,
         errorMessage: (err as Error).message,
       }))
     }
@@ -415,14 +445,25 @@ export function useJobDetail(jobId: string) {
         case 'cve_done': {
           addLog('vex_analyzing', `✓ ${ev.cve_id} 완료: ${ev.status}`)
           // ``cve_result`` payload 에 이미 디스크 기준 최신 상태(
-          // vex_status / vex_justification / vex_detail / exploitability_tier)
-          // 가 들어 있으므로 patch 적용만으로 UI 가 정합하다.  추가
-          // fetch 는 불필요 (네트워크 낭비).  단 result 가 아직 null
-          // (페이지 로드 직후) 이면 patch 를 붙일 곳이 없으니 한 번만
-          // fetch.
+          // vex_status / vex_justification / vex_detail / analysis_grade /
+          // analysis_evidence / analysis_model) 가 들어 있어 patch 만으로
+          // UI 가 정합해야 한다.  단 SSE 가 끊겼다 재연결되는 사이에 한
+          // 두 이벤트가 누락되면 "분석은 됐는데 행이 안 변하는" 증상이
+          // 나오므로, patch 적용 + 짧은 debounce 후 ``/result`` 를 한 번
+          // 더 가져와 fresh state 로 덮어쓴다 (loadingRef in-flight guard
+          // 로 부담 최소).
           const patch = ev.cve_result as CveResult | undefined
           let needFullLoad = !patch
           if (patch) {
+            // DevTools 진단용 — 어떤 필드가 들어왔는지 한 줄 로그
+            // (배포 시 빼고 싶으면 import.meta.env.DEV 가드)
+            // eslint-disable-next-line no-console
+            console.debug('[cve_done patch]', patch.cve_id, {
+              vex_status: patch.vex_status,
+              analysis_grade: patch.analysis_grade,
+              analysis_evidence: patch.analysis_evidence,
+              analysis_model: patch.analysis_model,
+            })
             setState((s) => {
               if (!s.result) {
                 needFullLoad = true
@@ -445,7 +486,18 @@ export function useJobDetail(jobId: string) {
               }
             })
           }
-          if (needFullLoad) void loadResult()
+          if (needFullLoad) {
+            void loadResult()
+          } else {
+            // patch 적용 직후 추가 fetch 로 SSE 누락 방어.  연속 cve_done
+            // 이 쏟아질 때는 마지막 이벤트 후 1.5s 한 번만 발화되도록
+            // debounce.
+            if (cveDoneRefreshRef.current) clearTimeout(cveDoneRefreshRef.current)
+            cveDoneRefreshRef.current = setTimeout(() => {
+              cveDoneRefreshRef.current = null
+              void loadResult()
+            }, 1500)
+          }
           break
         }
 
@@ -516,5 +568,6 @@ export function useJobDetail(jobId: string) {
     resumeVexFrom: handleResumeVexFrom,
     retryVexSingle: handleRetryVexSingle,
     cancelVex: handleCancelVex,
+    resumeFromSbom: handleResumeFromSbom,
   }
 }

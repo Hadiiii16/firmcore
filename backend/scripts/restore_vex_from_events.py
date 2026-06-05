@@ -70,12 +70,19 @@ def _build_vex_json(
     """Reconstruct a minimal OpenVEX document for a single CVE."""
     status = cve_result.get("vex_status") or "under_investigation"
     justification = cve_result.get("vex_justification")
-    tier = cve_result.get("exploitability_tier")
+    grade = cve_result.get("analysis_grade")
+    evidence = cve_result.get("analysis_evidence")
     detail = cve_result.get("vex_detail") or ""
 
-    impact_prefix = f"[EXPLOITABILITY_TIER: {(tier or 'NONE').upper()}] "
-    # vex_detail 은 보통 ② 보고서 전체 텍스트인데, impact_statement 는
-    # 한 줄 요약이 적합.  보고서에서 첫 줄 또는 판정 단계 한 줄을 취함.
+    # GEMINI.md v5.0 prefix 형식: [EVIDENCE: …] [GRADE: …] (affected 일 때만)
+    prefix_parts: list[str] = []
+    if evidence:
+        prefix_parts.append(f"[EVIDENCE: {evidence.upper()}]")
+    if status == "affected" and grade:
+        prefix_parts.append(f"[GRADE: {grade.upper()}]")
+    impact_prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
+    # vex_detail 은 보통 보고서 전체 텍스트인데, impact_statement 는 한 줄
+    # 요약이 적합.  보고서에서 첫 줄 또는 판정 단계 한 줄을 취함.
     first_meaningful = next(
         (ln.strip() for ln in detail.splitlines() if ln.strip() and not ln.startswith("=")),
         cve_id,
@@ -97,8 +104,10 @@ def _build_vex_json(
     }
     if justification and status not in ("affected", "fixed", "under_investigation"):
         stmt["justification"] = justification
-    if tier:
-        stmt["x_firmcore_exploitability_tier"] = tier
+    if grade:
+        stmt["x_firmcore_grade"] = grade.upper()
+    if evidence:
+        stmt["x_firmcore_evidence"] = evidence.upper()
 
     return {
         "@context": "https://openvex.dev/ns/v0.2.0",

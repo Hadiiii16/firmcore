@@ -1,6 +1,6 @@
 import { useMemo, useState, type MouseEvent } from 'react'
 import { RefreshCw, Bot, ChevronDown, ChevronRight, FastForward, Zap, Gem } from 'lucide-react'
-import { SeverityBadge, VexBadge, ModelBadge } from '../../components/Badge'
+import { SeverityBadge, VexBadge, ModelBadge, EvidenceBadge } from '../../components/Badge'
 import type { CveResult, JobStatus } from '../../types'
 
 interface VexAnalysisTabProps {
@@ -18,14 +18,36 @@ interface VexAnalysisTabProps {
 // Resume from here 인덱스가 일치한다.  사용자가 sort dropdown 으로
 // vex / cve 를 선택하면 그때만 다른 기준 사용.
 const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NEGLIGIBLE', 'UNKNOWN']
-// affected (standard) → affected (low) → investigating → not_affected → fixed
-const VEX_ORDER = ['affected', 'affected_low', 'under_investigation', 'not_affected', 'fixed']
+// GEMINI.md v5.0 위험도 정렬:
+// affected_b (가장 시급) → affected_c → affected_d → investigating → not_affected → fixed
+const VEX_ORDER = [
+  'affected_a',          // exploit 시연 (사실상 발행 X)
+  'affected_b',          // 일반 affected, 패치 시급
+  'affected_c',          // 도달 가능, 완화 충족
+  'affected_d',          // 잠재 위험, 노출 증거 부재
+  'affected',            // grade 없는 affected (legacy / 누락)
+  'under_investigation',
+  'not_affected',
+  'fixed',
+]
 
 type SortKey = 'severity' | 'vex' | 'cve'
-type VexFilter = 'all' | 'affected' | 'affected_low' | 'not_affected' | 'under_investigation' | 'fixed' | 'unknown'
+type VexFilter =
+  | 'all'
+  | 'affected_b'
+  | 'affected_c'
+  | 'affected_d'
+  | 'not_affected'
+  | 'under_investigation'
+  | 'fixed'
+  | 'unknown'
 
 function vexKey(c: CveResult): string {
-  if (c.vex_status === 'affected' && c.exploitability_tier === 'low') return 'affected_low'
+  if (c.vex_status === 'affected') {
+    const g = (c.analysis_grade || '').toUpperCase()
+    if (g === 'A' || g === 'B' || g === 'C' || g === 'D') return `affected_${g.toLowerCase()}`
+    return 'affected'
+  }
   return c.vex_status ?? ''
 }
 
@@ -68,22 +90,29 @@ export function VexAnalysisTab({
     })
   }
 
-  // VEX 상태별 카운트 (한 번만 계산)
+  // VEX 상태별 카운트 (한 번만 계산).  affected 는 GRADE 별로 세분화.
   const stats = useMemo(() => {
     const s = {
       total: cves.length,
-      affected: 0,        // standard tier
-      affected_low: 0,
+      affected_b: 0,         // 일반 affected
+      affected_c: 0,         // 완화 충족
+      affected_d: 0,         // 잠재 위험
+      affected_a: 0,         // 사실상 0
+      affected_other: 0,     // grade 없는 legacy affected
       not_affected: 0,
       under_investigation: 0,
       fixed: 0,
-      unknown: 0,         // 분석 미실행
+      unknown: 0,            // 분석 미실행
     }
     for (const c of cves) {
       if (!c.vex_status || c.vex_status === 'unknown') { s.unknown++; continue }
       if (c.vex_status === 'affected') {
-        if (c.exploitability_tier === 'low') s.affected_low++
-        else s.affected++
+        const g = (c.analysis_grade || '').toUpperCase()
+        if (g === 'A') s.affected_a++
+        else if (g === 'B') s.affected_b++
+        else if (g === 'C') s.affected_c++
+        else if (g === 'D') s.affected_d++
+        else s.affected_other++
       } else if (c.vex_status === 'not_affected') s.not_affected++
       else if (c.vex_status === 'under_investigation') s.under_investigation++
       else if (c.vex_status === 'fixed') s.fixed++
@@ -96,8 +125,20 @@ export function VexAnalysisTab({
 
   const matchesFilter = (c: CveResult): boolean => {
     if (vexFilter === 'all') return true
-    const key = vexKey(c) || 'unknown'
-    return key === vexFilter
+    if (vexFilter === 'unknown') {
+      return !c.vex_status || c.vex_status === 'unknown'
+    }
+    // affected_b pill 은 GRADE B 외에 grade 가 없는 affected (legacy/누락)
+    // 와 사실상 발행 안 되는 GRADE A 도 함께 묶어 표시한다.
+    if (vexFilter === 'affected_b') {
+      if (c.vex_status !== 'affected') return false
+      const g = (c.analysis_grade || '').toUpperCase()
+      return g === '' || g === 'A' || g === 'B'
+    }
+    if (vexFilter === 'affected_c' || vexFilter === 'affected_d') {
+      return vexKey(c) === vexFilter
+    }
+    return c.vex_status === vexFilter
   }
 
   const withVex = sortCves(
@@ -117,15 +158,18 @@ export function VexAnalysisTab({
     )
   }
 
-  // 필터 pill 정의 (key, label, count, class tokens)
+  // 필터 pill 정의.  affected 는 GRADE 별로 세분화된 3개 pill.  legacy
+  // affected (grade=null) 는 affected_b 카운트에 합쳐져 표시되지 않으므로
+  // 사용자에겐 D/C/B 만 노출 (분석 미완료 + 신규 잡 정상 흐름).
   const filterPills: Array<{ key: VexFilter; label: string; count: number; active: string; inactive: string }> = [
-    { key: 'all',                 label: 'ALL',         count: stats.total,              active: 'bg-surface-700 text-gray-100 border-surface-500', inactive: 'bg-surface-800/60 text-gray-400 border-surface-700 hover:bg-surface-700/60' },
-    { key: 'affected',            label: 'AFFECTED',    count: stats.affected,           active: 'bg-red-900/60 text-red-200 border-red-700',        inactive: 'bg-red-900/15 text-red-400 border-red-900/40 hover:bg-red-900/30' },
-    { key: 'affected_low',        label: 'AFF·LOW',     count: stats.affected_low,       active: 'bg-orange-900/60 text-orange-200 border-orange-700', inactive: 'bg-orange-900/15 text-orange-400 border-orange-900/40 hover:bg-orange-900/30' },
-    { key: 'not_affected',        label: 'NOT AFFECTED', count: stats.not_affected,      active: 'bg-green-900/60 text-green-200 border-green-700',  inactive: 'bg-green-900/15 text-accent-green border-green-900/40 hover:bg-green-900/30' },
-    { key: 'under_investigation', label: 'INVESTIGATING', count: stats.under_investigation, active: 'bg-amber-900/60 text-amber-200 border-amber-700', inactive: 'bg-amber-900/15 text-amber-400 border-amber-900/40 hover:bg-amber-900/30' },
-    { key: 'fixed',               label: 'FIXED',       count: stats.fixed,              active: 'bg-blue-900/60 text-blue-200 border-blue-700',     inactive: 'bg-blue-900/15 text-blue-400 border-blue-900/40 hover:bg-blue-900/30' },
-    { key: 'unknown',             label: 'UNANALYZED',  count: stats.unknown,            active: 'bg-surface-700 text-gray-100 border-surface-500',  inactive: 'bg-surface-800/60 text-gray-500 border-surface-700 hover:bg-surface-700/60' },
+    { key: 'all',                 label: 'ALL',          count: stats.total,                active: 'bg-surface-700 text-gray-100 border-surface-500',  inactive: 'bg-surface-800/60 text-gray-400 border-surface-700 hover:bg-surface-700/60' },
+    { key: 'affected_b',          label: 'AFF·B',        count: stats.affected_b + stats.affected_other + stats.affected_a, active: 'bg-red-900/60 text-red-200 border-red-700',         inactive: 'bg-red-900/15 text-red-400 border-red-900/40 hover:bg-red-900/30' },
+    { key: 'affected_c',          label: 'AFF·C',        count: stats.affected_c,           active: 'bg-orange-900/60 text-orange-200 border-orange-700', inactive: 'bg-orange-900/15 text-orange-400 border-orange-900/40 hover:bg-orange-900/30' },
+    { key: 'affected_d',          label: 'AFF·D',        count: stats.affected_d,           active: 'bg-yellow-900/60 text-yellow-200 border-yellow-700', inactive: 'bg-yellow-900/15 text-yellow-400 border-yellow-900/40 hover:bg-yellow-900/30' },
+    { key: 'not_affected',        label: 'NOT AFFECTED', count: stats.not_affected,         active: 'bg-green-900/60 text-green-200 border-green-700',   inactive: 'bg-green-900/15 text-accent-green border-green-900/40 hover:bg-green-900/30' },
+    { key: 'under_investigation', label: 'INVESTIGATING', count: stats.under_investigation, active: 'bg-amber-900/60 text-amber-200 border-amber-700',   inactive: 'bg-amber-900/15 text-amber-400 border-amber-900/40 hover:bg-amber-900/30' },
+    { key: 'fixed',               label: 'FIXED',        count: stats.fixed,                active: 'bg-blue-900/60 text-blue-200 border-blue-700',      inactive: 'bg-blue-900/15 text-blue-400 border-blue-900/40 hover:bg-blue-900/30' },
+    { key: 'unknown',             label: 'UNANALYZED',   count: stats.unknown,              active: 'bg-surface-700 text-gray-100 border-surface-500',   inactive: 'bg-surface-800/60 text-gray-500 border-surface-700 hover:bg-surface-700/60' },
   ]
 
   // Re-analyze 는 Pro / Codex / Flash 3가지 엔진·모델 선택 가능한 분리 버튼.
@@ -274,7 +318,7 @@ export function VexAnalysisTab({
                 </span>
                 <div className="ml-auto flex items-center gap-2 shrink-0">
                   <ModelBadge model={cve.analysis_model} />
-                  <VexBadge status={cve.vex_status} tier={cve.exploitability_tier} />
+                  <VexBadge status={cve.vex_status} grade={cve.analysis_grade} />
                   <RetryButtonGroup cveId={cve.cve_id} />
                   <ResumeFromButton cveId={cve.cve_id} />
                 </div>

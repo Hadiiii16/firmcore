@@ -4,7 +4,7 @@ main.py — FirmCore FastAPI 애플리케이션
 CORS, 라우터, lifespan(DB 초기화), 전역 예외 핸들러를 설정합니다.
 
 실행:
-    uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Mock 모드:
     MOCK_PIPELINE=true uvicorn main:app --reload
@@ -211,7 +211,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://localhost:8080",   # 자기 자신 (Swagger UI)
+        "http://localhost:8000",   # 자기 자신 (Swagger UI)
         "http://127.0.0.1:3000",
         # Vite 는 5173 이 이미 사용 중이면 5174~5179 로 자동 폴백하므로
         # 그 범위를 전부 허용한다.
